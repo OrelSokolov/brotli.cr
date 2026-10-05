@@ -12,3 +12,6 @@
 
 # Pinned upstream clone (google/brotli @ 42a2ed4, see PLAN.md)
 /upstream/
+
+# Release/dev binaries (rake build)
+/build/

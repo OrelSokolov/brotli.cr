@@ -21,6 +21,7 @@ require "./huffman"
 require "./constants"
 require "./types"
 require "./tables_data"
+require "./cmd_lut_data"
 require "./dictionary_data"
 require "./transform"
 
@@ -1621,7 +1622,7 @@ module Brotli
       cmd0 = safe_read_symbol(@htree_command.not_nil!)
       return nil unless cmd0
       cmd_code = cmd0.to_i32
-      v = CMD_LUT.unsafe_fetch(cmd_code)
+      v = CMD_LUT_OPTIMIZED.unsafe_fetch(cmd_code)
       @distance_code = v.distance_code.to_i32
       @distance_context = v.context.to_i32
       @dist_htree_index = @dist_context_map_slice.not_nil![@distance_context].to_i32
@@ -1639,7 +1640,7 @@ module Brotli
 
     private def read_command : Int32
       cmd_code = read_symbol(@htree_command.not_nil!).to_i32
-      v = CMD_LUT.unsafe_fetch(cmd_code)
+      v = CMD_LUT_OPTIMIZED.unsafe_fetch(cmd_code)
       @distance_code = v.distance_code.to_i32
       @distance_context = v.context.to_i32
       @dist_htree_index = @dist_context_map_slice.not_nil![@distance_context].to_i32
