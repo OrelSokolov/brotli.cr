@@ -1,0 +1,33 @@
+# brotli.cr CLI: mirror of tmp_c/oracle_main.c.
+#
+# Usage:   brotli_decode <input.br> [output]
+#          (no output arg -> stdout)
+# Exit:    0 success, 1 decode error (error code on stderr), 2 truncated
+# stderr:  "ERROR code=<N>" on failure, "OK <bytes>" on success.
+
+require "../src/brotli"
+
+if ARGV.size < 1
+  STDERR.puts "usage: #{PROGRAM_NAME} <input.br> [output]"
+  exit 3
+end
+
+input = File.read(ARGV[0])
+
+out_io = ARGV.size > 1 ? File.open(ARGV[1], "w") : STDOUT
+decoder = Brotli::Decoder.new
+begin
+  data = decoder.decode(input.to_slice)
+  out_io.write(data)
+  out_io.flush
+  STDERR.puts "OK #{data.size}"
+  exit 0
+rescue e : Brotli::DecodeError
+  if e.code == Brotli::DECODER_NEEDS_MORE_INPUT
+    STDERR.puts "TRUNCATED"
+    exit 2
+  else
+    STDERR.puts "ERROR code=#{e.code}"
+    exit 1
+  end
+end

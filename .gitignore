@@ -1,0 +1,14 @@
+# Crystal
+/lib/
+/.shards/
+*.dwarf
+
+# Scratch: Silesia corpus, downloaded fonts, test artifacts
+/tmp/
+
+# Built binaries and derived files (oracle_main.c source is kept)
+/tmp_c/*
+!/tmp_c/oracle_main.c
+
+# Pinned upstream clone (google/brotli @ 42a2ed4, see PLAN.md)
+/upstream/
