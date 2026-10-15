@@ -39,7 +39,13 @@ module Brotli
     # backward_references_inc.h:10 — returns the appended commands plus the
     # number of literals in them; `last_insert_len` carries the pending
     # insert run between calls (mutated dist_cache in place, as in C).
+    # position_offset is C's params->stream_offset: how much data precedes
+    # the ring buffer (fragment-relative encoding passes frag_pos), so that
+    # static-dictionary distances base off the ABSOLUTE position — the
+    # decoder resolves dict references only for distances beyond
+    # min(abs_pos, max_backward_limit).
     def self.create_backward_references(num_bytes : Int32, position : Int32,
+                                        position_offset : Int32,
                                         data : Bytes, mask : Int32,
                                         params : Params,
                                         hasher : QuicklyHasher,
@@ -69,12 +75,13 @@ module Brotli
       while pos &+ 8 < pos_end
         max_length = pos_end &- pos
         max_distance = Math.min(pos, max_backward_limit)
-        dictionary_start = Math.min(pos, max_backward_limit)
+        dictionary_start = Math.min(pos &+ position_offset,
+                                    max_backward_limit)
         sr = HasherSearchResult.new
         sr.score = min_score
         hasher.find_longest_match(dict, data, mask, dist_cache, pos,
                                   max_length, max_distance, dictionary_start,
-                                  params.dist.max_distance, sr)
+                                  params.dist.max_distance.to_i32!, sr)
         if sr.score > min_score
           # Found a match. Let's look for something even better ahead.
           delayed_backward_references_in_row = 0
@@ -86,11 +93,12 @@ module Brotli
               Math.min(sr.len &- 1, max_length) : 0
             sr2.score = min_score
             max_distance = Math.min(pos &+ 1, max_backward_limit)
-            dictionary_start = Math.min(pos &+ 1, max_backward_limit)
+            dictionary_start = Math.min(pos &+ 1 &+ position_offset,
+                                        max_backward_limit)
             hasher.find_longest_match(dict, data, mask, dist_cache, pos &+ 1,
                                       max_length, max_distance,
                                       dictionary_start,
-                                      params.dist.max_distance, sr2)
+                                      params.dist.max_distance.to_i32!, sr2)
             if sr2.score >= sr.score &+ cost_diff_lazy
               # Ok, let's just write one byte for now and start a match
               # from the next byte.
@@ -107,7 +115,8 @@ module Brotli
           end
           apply_random_heuristics =
             pos &+ 2 &* sr.len &+ random_heuristics_window_size
-          dictionary_start = Math.min(pos, max_backward_limit)
+          dictionary_start = Math.min(pos &+ position_offset,
+                                      max_backward_limit)
           # The first 16 codes are special short-codes, and the minimum
           # offset is 1.
           distance_code = compute_distance_code(sr.distance,

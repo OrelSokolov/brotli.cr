@@ -433,6 +433,51 @@ roundtrip, суммарно −1.1% vs C. 56 spec зелёные.
 
 ### E4. Хэшеры H2/H3/H4/H54 + greedy/lazy → q2, q3 (StoreMetaBlockFast/Trivial)
 
+ВЫПОЛНЕНО. Файлы: `enc/hashers.cr` (QuicklyHasher h2/h3, prepare/store/
+store_range/stitch_to_previous_block/find_longest_match), `enc/static_dict.cr`
++ `enc/encoder_dict.cr` (EncoderDictionary.default, поиск в статик-словаре
+с трансформами, cutoffTransforms), `enc/backward_references.cr`
+(create_backward_references: greedy+lazy до 4 задержек, random-heuristics
+скачки, compute_distance_code с шорт-кодами кэша), `enc/command.cr`
+(Command: copy_len 25 бит + delta<<25, dist_prefix code|nbits<<10,
+Command.insert), `enc/bit_stream.cr` (store_meta_block_fast q≤2:
+статические cmd/dist-деревья при ≤128 командах, иначе BuildFast по
+гистограммам; store_meta_block_trivial q3; build_histograms/
+store_data_with_huffman_codes; store_uncompressed + откат dist_cache),
+`enc/params.cr` (choose_hasher, compute_lg_block, init_distance_params),
+encoder.cr: encode_blocks.
+
+Схема encode_blocks (одноваттовый аналог EncodeData): фрагменты 1<<lgwin;
+rb = фрагмент, паддингованный до степени двойки (mask = rb−1, без wrap);
+хэшер fresh на фрагмент (one_shot=true, frag), stitch после каждого блока;
+блоки 1<<lgblock = метаблоки; should_compress? (гистограммный энтропийный
+фильтр encode.c:466) с uncompressed-фолбэком и откатом dist_cache;
+last_bytes переносится между фрагментами.
+
+Ключевые нюансы, найденные отладкой:
+1) Хвостовая insert-команда эмитится на КАЖДЫЙ блок (encode.c:1181),
+   не только на is_last — иначе блок без copy-команд даёт метаблок
+   с пустым списком команд и непокрытым MLEN (FORMAT_PADDING/десинк).
+   При last_insert_len == 0 не эмитится.
+2) dist_cache инициализируется {4,11,15,16} ОДИН раз и переносится
+   через границы фрагментов: поток непрерывен, декодерный dist-ринг
+   не сбрасывается — шорт-коды дистанций 0..15 во 2+ фрагменте читались
+   бы из чужого кэша (ловится как FORMAT_DISTANCE −16 через
+   TakeDistanceFromRingBuffer → 0x7FFFFFFF).
+3) Короткие дист-коды дают dist_rb[last]+delta; отрицательные значения
+   декодер превращает в INT_MAX и фейлит.
+4) dictionary_start для статик-словаря считается от АБСОЛЮТНОЙ позиции
+   (pos + frag_pos, как C position_offset=stream_offset): дистанция
+   словарного матча должна превышать min(abs_pos, max_backward_limit)
+   декодера, иначе он возьмёт обычный LZ77-copy вместо словарной ветки
+   (при copy_len_code = word_len > matchlen это даёт +delta к покрытию
+   блока → FORMAT_BLOCK_LENGTH_2 −10).
+
+Тесты: encode_test q2/q3/q0/q1 24/24 (оракул + собственный декодер),
+56 spec, краевые (пусто, 1 байт, random 64K/1M, abc-400K — RLE хуже C,
+q2 538 vs 25: нет длинных RLE-матчей вне блоков, задокументировано),
+Silesia q2/q3 12/12 roundtrip.
+
 ### E5. Конвейер q4–q9: histogram/bit_cost/cluster/block_splitter/metablock/
 bit_stream (BlockEncoder, EncodeContextMap), H5/H6, H40–42, merge-or-emit,
 uncompressed-фолбэк с откатом. Чекпоинт: Silesia q4–q9 roundtrip + ratio.

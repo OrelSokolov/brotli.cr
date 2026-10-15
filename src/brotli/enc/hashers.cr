@@ -259,10 +259,10 @@ module Brotli
         if prev_ix < cur_ix && cached_backward <= max_backward
           prev_ix &= ring_buffer_mask
           if compare_char == data.unsafe_fetch(prev_ix &+ best_len)
-            len = find_match_length_with_limit(data, prev_ix, cur_ix_masked,
+            len = Enc.find_match_length_with_limit(data, prev_ix, cur_ix_masked,
                                                max_length)
             if len >= 4
-              score = backward_reference_score_using_last_distance(len)
+              score = Enc.backward_reference_score_using_last_distance(len)
               if best_score < score
                 sr.len = len
                 sr.distance = cached_backward
@@ -287,10 +287,10 @@ module Brotli
           prev_ix &= ring_buffer_mask
           return if compare_char != data.unsafe_fetch(prev_ix &+ best_len_in)
           return if backward == 0 || backward > max_backward
-          len = find_match_length_with_limit(data, prev_ix, cur_ix_masked,
+          len = Enc.find_match_length_with_limit(data, prev_ix, cur_ix_masked,
                                              max_length)
           if len >= 4
-            score = backward_reference_score(len, backward)
+            score = Enc.backward_reference_score(len, backward)
             if best_score < score
               sr.len = len
               sr.distance = backward
@@ -302,7 +302,7 @@ module Brotli
           keys = StaticArray(Int32, 4).new(0)
           i = 0
           while i < @bucket_sweep
-            keys[i] = (key &+ (i << 3)) & @bucket_mask
+            keys[i] = (key.to_i32! &+ (i << 3)) & @bucket_mask
             i &+= 1
           end
           key_out = keys[(cur_ix & @bucket_sweep_mask) >> 3]
@@ -314,10 +314,10 @@ module Brotli
             i &+= 1
             next if compare_char != data.unsafe_fetch(prev_ix &+ best_len)
             next if backward == 0 || backward > max_backward
-            len = find_match_length_with_limit(data, prev_ix, cur_ix_masked,
+            len = Enc.find_match_length_with_limit(data, prev_ix, cur_ix_masked,
                                                max_length)
             if len >= 4
-              score = backward_reference_score(len, backward)
+              score = Enc.backward_reference_score(len, backward)
               if best_score < score
                 best_len = len
                 sr.len = len
@@ -329,7 +329,7 @@ module Brotli
             end
           end
           if @use_dict && min_score == sr.score
-            search_in_static_dictionary(dict, @common, data, cur_ix_masked,
+            Enc.search_in_static_dictionary(dict, @common, data, cur_ix_masked,
                                         max_length, dictionary_distance,
                                         max_distance, sr, true)
           end
@@ -338,7 +338,7 @@ module Brotli
         end
 
         if @use_dict && min_score == sr.score
-          search_in_static_dictionary(dict, @common, data, cur_ix_masked,
+          Enc.search_in_static_dictionary(dict, @common, data, cur_ix_masked,
                                       max_length, dictionary_distance,
                                       max_distance, sr, true)
         end
