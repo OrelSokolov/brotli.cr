@@ -416,7 +416,20 @@ cmd_depth остаются stale-глубины → пересуженное д�
 команды со 2-го метаблока. Инструменты: `tmp_c/enc_roundtrip.cr`
 (бинарник `tmp_c/enc_roundtrip`, API: `enc_roundtrip <q> <in> <out> [dec]`).
 
-### E3. q1 (compress_fragment_two_pass; свой CommandPrefixCode shuffle!)
+### E3. q1 (compress_fragment_two_pass; свой CommandPrefixCode shuffle!) — ВЫПОЛНЕНО
+`enc/compress_fragment_two_pass.cr` (TwoPassArena, двухпроходная схема:
+create_commands → буферы команд/литералов → store_commands с деревьями по
+фактическим гистограммам; ДРУГОЙ shuffle командного префикс-кода, свои
+EmitInsertLen/CopyLen/Distance с кодировкой code | extra<<8, маркер
+последней дистанции = 64, таблицы kNumExtraBits/kInsertOffset,
+ShouldCompress через bits_entropy, uncompressed-фолбэк с
+rewind; min_match 4/6 по table_bits ≤/> 15, включая upstream-типу в
+min-match-4 пост-копи апдейте — offset 0 вместо 2, портирован faithfully),
+`enc/bit_cost.cr` (bits_entropy), encoder.cr: encode_fast(one_pass) —
+общий фрагментный цикл q0/q1 (odd-shift fixup только q0). Тесты:
+encode_test.sh q1 24/24 testdata (двойной roundtrip), краевые (пусто,
+1 байт, random 300K/700K, >256K, abc-400K) OK, Silesia q1 12/12
+roundtrip, суммарно −1.1% vs C. 56 spec зелёные.
 
 ### E4. Хэшеры H2/H3/H4/H54 + greedy/lazy → q2, q3 (StoreMetaBlockFast/Trivial)
 

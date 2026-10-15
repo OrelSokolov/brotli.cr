@@ -27,6 +27,8 @@ require "./brotli/enc/command"
 require "./brotli/enc/entropy_encode"
 require "./brotli/enc/bit_stream"
 require "./brotli/enc/compress_fragment"
+require "./brotli/enc/bit_cost"
+require "./brotli/enc/compress_fragment_two_pass"
 require "./brotli/enc/encoder"
 
 module Brotli

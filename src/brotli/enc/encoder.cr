@@ -37,10 +37,12 @@ module Brotli
         choose_distance_params
         case @params.quality
         when FAST_ONE_PASS_COMPRESSION_QUALITY
-          encode_one_pass(input)
+          encode_fast(input, one_pass: true)
+        when FAST_TWO_PASS_COMPRESSION_QUALITY
+          encode_fast(input, one_pass: false)
         else
           raise NotImplementedError.new(
-            "quality #{@params.quality} is not ported yet (phases E3+)")
+            "quality #{@params.quality} is not ported yet (phases E4+)")
         end
       end
 
@@ -66,24 +68,27 @@ module Brotli
 
       # encode.c:1437 — the q0/q1 fast loop, one-shot: chunks the input by
       # 1 << lgwin fragments, carrying last_bytes between fragments.
-      private def encode_one_pass(input : Bytes) : Bytes
+      private def encode_fast(input : Bytes, one_pass : Bool) : Bytes
         lgwin = @params.lgwin
         if lgwin < 18
           lgwin = 18 # C: fast qualities need the 2^18 window
         end
 
-        # encode.c:157 — HashTableSize + q0 odd-shift fixup.
+        # encode.c:157 — HashTableSize (+ q0 odd-shift fixup, one-pass only).
         max_table_size = Enc.max_hash_table_size(@params.quality).to_u64
         htsize = 256_u64
         while htsize < max_table_size && htsize < input.size
           htsize <<= 1
         end
-        if (htsize & 0xAAAAA) == 0 # only odd shifts for one-pass
+        if one_pass && (htsize & 0xAAAAA) == 0 # only odd shifts for one-pass
           htsize <<= 1
         end
 
         last_bytes, last_bytes_bits = Enc.encode_window_bits(lgwin)
-        arena = OnePassArena.new
+        one_pass_arena = one_pass ? OnePassArena.new : nil
+        two_pass_arena = one_pass ? nil : TwoPassArena.new
+        command_buf = one_pass ? nil : Slice(UInt32).new(TWO_PASS_BLOCK_SIZE)
+        literal_buf = one_pass ? nil : Bytes.new(TWO_PASS_BLOCK_SIZE)
         table = Slice(Int32).new(htsize.to_i32)
         out = IO::Memory.new(input.size // 2 + 64)
         block_size_limit = 1_u64 << lgwin
@@ -100,8 +105,15 @@ module Brotli
           w = BitWriter.new(storage, last_bytes_bits.to_i32)
           table.fill(0)
 
-          Enc.compress_fragment_fast(arena, input, pos, block, is_last,
-                                     table, htsize.to_i32, w)
+          if one_pass
+            Enc.compress_fragment_fast(one_pass_arena.not_nil!, input, pos,
+                                       block, is_last, table, htsize.to_i32, w)
+          else
+            Enc.compress_fragment_two_pass(
+              two_pass_arena.not_nil!, input, pos, block, is_last,
+              command_buf.not_nil!, literal_buf.not_nil!, table,
+              htsize.to_i32, w)
+          end
 
           out_bytes = w.pos >> 3
           out.write(storage[0, out_bytes])
