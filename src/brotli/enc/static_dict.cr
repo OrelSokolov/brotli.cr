@@ -26,7 +26,7 @@ module Brotli
 
       # find_match_length between two DIFFERENT buffers (dictionary word and
       # ring buffer); C FindMatchLengthWithLimit with two pointers.
-      private def self.match_length(dict : Bytes, d : Int32, data : Bytes,
+      def self.match_length(dict : Bytes, d : Int32, data : Bytes,
                                     s : Int32, limit : Int32) : Int32
         base = d
         l = limit
