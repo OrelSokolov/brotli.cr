@@ -1,6 +1,6 @@
-# Brotli decoder in pure Crystal, ported from google/brotli c/dec
-# (upstream pinned at 42a2ed4, 2026-09-30). Decoder only — the target
-# use case is WOFF2 font decoding; the encoder is out of scope.
+# Brotli decoder + encoder in pure Crystal, ported from google/brotli c/dec
+# and c/enc (upstream pinned at 42a2ed4, 2026-09-30). Target use cases:
+# WOFF2 font decoding for freetype.cr, asset compression (brotli encoder).
 #
 # Port rules (same as freetype.cr):
 #   * one Crystal module per upstream C file, C symbol names kept as
@@ -19,6 +19,12 @@ require "./brotli/dictionary_data"
 require "./brotli/transform"
 require "./brotli/huffman"
 require "./brotli/decoder"
+require "./brotli/enc/enc_tables_data"
+require "./brotli/enc/match_cost"
+require "./brotli/enc/bit_writer"
+require "./brotli/enc/params"
+require "./brotli/enc/command"
+require "./brotli/enc/entropy_encode"
 
 module Brotli
   VERSION = "0.1.0" # keep in sync with shard.yml

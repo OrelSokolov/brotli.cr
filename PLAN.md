@@ -1,8 +1,8 @@
-# brotli.cr — порт декодера Brotli на Crystal
+# brotli.cr — порт Brotli на Crystal
 
-Цель: чистокристальный декодер Brotli (RFC 7932) для расшифровки WOFF2
-в freetype.cr. Энкодер (10+ тыс. строк) не портируется — ридеру шрифтов
-нужна только декомпрессия.
+Цель: чистокристальный декодер и энкодер Brotli (RFC 7932). Декодер —
+для расшифровки WOFF2 в freetype.cr; энкодер (порт c/enc, q0–q11) —
+для сборки ассетов (brotli-компрессия в Rails-подобных пайплайнах).
 
 ## Референс
 
@@ -341,3 +341,80 @@ CommandPostWrapCopy; иначе copy остатка (i>32 memcpy / >16 memmove16
 - [x] мутационные тесты: 100% совпадение error codes с оракулом
       (`tools/mutation_test.cr`: 902/902)
 - [x] бенчмарк ≤ 2x от C (`tools/bench.sh`: Silesia q9 — 1.65x, q11 — 1.66x)
+
+---
+
+# Энкодер: план порта c/enc (q0–q11)
+
+Утверждённый план (полная версия: `tmp/encoder_plan.md`). Совместимость =
+корректный RFC 7932 поток (двойной roundtrip: наш декодер + C-оракул),
+байтовая идентичность выводу C-энкодера НЕ требуется; ratio vs C — метрика
+качества. API: one-shot `Brotli.encode(input, quality, lgwin)`.
+
+Out of scope: streaming API, large window (lgwin>24, композиты/rolling),
+SIMD-хэшеры (скалярные H5/H6 эквивалентны), compound/shared словари,
+base64-regions, MemoryManager (есть GC).
+
+## Фазы
+
+### E0. Таблицы — ВЫПОЛНЕНО
+`tools/dump_tables.c` расширен: base64-блобы `DICT_HASH_WORDS/LENGTHS`,
+`STATIC_DICTIONARY_BUCKETS`, `STATIC_DICTIONARY_WORDS_{LEN,TRANSFORM,IDX}`
+(u16 LE, генерятся через `le_u16`), литералы entropy_encode_static
+(`CODE_LENGTH_*`, `STATIC_{COMMAND,DISTANCE}_CODE_*`, `{ZERO,NON_ZERO}_REPS_*`)
+→ `src/brotli/enc/enc_tables_data.cr` (429 КБ; `tools/gen_tables.sh` с
+argv[2]). Спека `spec/enc_tables_spec.cr`: FNV-1a64-контрольные суммы
+(захардкожены из C-дампера), размеры, Kraft для префикс-кодов, границы
+элементов. 26/26 spec, декодер не тронут (diff_test 45/45).
+Нюансы: reps-таблицы — не префикс-коды (depth = суммарные биты RLE-всплеска,
+до 30); `WORDS[0]` — сантинел (len=0); слоты buckets начинаются с 1.
+
+### E1. Инфраструктура
+`enc/bit_writer.cr` (write_bits/update_bits/rewind), `enc/command.cr`,
+`enc/params.cr` (SanitizeParams/ComputeLgBlock/ChooseHasher/
+CalculateDistanceLUT), `enc/entropy_encode.cr`, `enc/match_cost.cr`
++ юнит-спеки.
+
+### E1. Инфраструктура — ВЫПОЛНЕНО
+`enc/bit_writer.cr` (write_bits LSB-first ≤56 бит, update_bits — in-place
+патч MLEN, rewind_bit_position с маскировкой хвоста), `enc/command.cr`
+(Command-структура {insert_len, copy_len+7-битный delta, dist_prefix/extra},
+insert/copy length codes, combine_length_codes, prefix_encode_copy_distance,
+restore_distance_code, distance_context), `enc/params.cr` (Mode/Params/
+HasherParams/DistanceParams, sanitize_params!, compute_lg_block/rb_bits,
+max_metablock_size, choose_hasher — без SIMD/large-window веток,
+init_distance_params), `enc/entropy_encode.cr` (create_huffman_tree c
+count_limit-циклом, set_depth, convert_bit_depths_to_symbols c реверсом
+бит, write_huffman_tree RLE 16/17, optimize_huffman_counts_for_rle 24.8
+fixed point), `enc/match_cost.cr` (log2_floor/fast_log2,
+find_match_length_with_limit 8-байтовым XOR + TZCNT, mostly_utf8?).
+Спеки: 30 новых (bit_writer — независимый LSB-ридер, command — полное
+покрытие InsBase/CopyBase против таблиц и CMD_LUT декодера (24×24),
+prefix_encode против RFC-референса + roundtrip restore, entropy — Kraft-
+равенство, лимит глубины на Фибоначчи, декодирование наших кодов ТАБЛИЦАМИ
+ДЕКОДЕРА (huffman.cr), RLE-реконструкция с иерархической семантикой
+(repeat-2)<<bits, match_cost — против наивных реализаций). Итог: 56/56
+spec, diff_test 45/45. Найденные при отладке порта баги: потерянный
+`continue` в set_depth (спуск влево проваливался в pop-секцию), лишний
+`&` вместо `&-` в restore_distance_code, Command.insert нельзя выражать
+через prefix_encode(16) — граница 16 уходит в регулярную ветку.
+
+### E2. q0 (compress_fragment one-pass) → первый рабочий энкодер
+Чекпоинт: двойной roundtrip testdata+Silesia q0, ratio vs C ±3%.
+
+### E3. q1 (compress_fragment_two_pass; свой CommandPrefixCode shuffle!)
+
+### E4. Хэшеры H2/H3/H4/H54 + greedy/lazy → q2, q3 (StoreMetaBlockFast/Trivial)
+
+### E5. Конвейер q4–q9: histogram/bit_cost/cluster/block_splitter/metablock/
+bit_stream (BlockEncoder, EncodeContextMap), H5/H6, H40–42, merge-or-emit,
+uncompressed-фолбэк с откатом. Чекпоинт: Silesia q4–q9 roundtrip + ratio.
+
+### E6. HQ q10–q11: static_dict (reuse transform.cr), H10 binary tree,
+Zopfli DP (Float32!), BrotliBuildMetaBlock.
+
+### E7. CLI `bin/brotli_encode` + `tools/encode_test.sh` (двойной roundtrip
+всех q на testdata/Silesia/шрифтах/ассетах; краевые: пусто, 1 байт, random,
+>64MB, UTF8/binary) + отчёт ratio vs C.
+
+### E8. Производительность: цель ≤3x от C на q1/q5/q9 (q11 — зафиксировать).
