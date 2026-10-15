@@ -399,8 +399,22 @@ spec, diff_test 45/45. Найденные при отладке порта ба�
 `&` вместо `&-` в restore_distance_code, Command.insert нельзя выражать
 через prefix_encode(16) — граница 16 уходит в регулярную ветку.
 
-### E2. q0 (compress_fragment one-pass) → первый рабочий энкодер
-Чекпоинт: двойной roundtrip testdata+Silesia q0, ratio vs C ±3%.
+### E2. q0 (compress_fragment one-pass) → первый рабочий энкодер — ВЫПОЛНЕНО
+`enc/compress_fragment.cr` (OnePassArena, state machine по C-меткам
+emit_commands/emit_remainder/next_block, `goto emit_remainder` = raise
+RemainderSignal, `goto trawl` влит в цикл скана), `enc/bit_stream.cr`
+(store_huffman_tree с RLE, build_and_store_huffman_tree_fast,
+store_static_code_length_code), `enc/encoder.cr` (q0 → encode_one_pass,
+фрагментация по 1<<lgwin, lgwin ≥ 18). Тесты: `tools/encode_test.sh`
+24/24 testdata (двойной roundtrip: наш декодер + C-оракул), Silesia
+q0 12/12 roundtrip, суммарно −0.46% vs C; краевые случаи (пусто, 1 байт,
+random 300KB/700KB, >256KB multi-fragment) OK. 56 spec зелёные,
+diff_test 45/45. Найденный баг порта: K_CMD_HISTO_SEED был 123 элемента
+вместо 128 (обрезан хвост) — seed обязан покрывать ненулевым счётчиком
+все символы с дефолтными глубинами, иначе при пересборке деревьев в
+cmd_depth остаются stale-глубины → пересуженное дерево и мусорные
+команды со 2-го метаблока. Инструменты: `tmp_c/enc_roundtrip.cr`
+(бинарник `tmp_c/enc_roundtrip`, API: `enc_roundtrip <q> <in> <out> [dec]`).
 
 ### E3. q1 (compress_fragment_two_pass; свой CommandPrefixCode shuffle!)
 

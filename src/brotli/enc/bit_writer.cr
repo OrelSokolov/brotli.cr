@@ -17,23 +17,18 @@ module Brotli
       def initialize(@storage : Bytes, @pos : Int32 = 0)
       end
 
-      def write_bits(n_bits : Int32, bits : UInt64) : Nil
+      # n_bits is coerced (depths arrive as UInt8/UInt32 lookups);
+      # bits values are zero-extended from any integer width.
+      def write_bits(n_bits : Int, bits : UInt64) : Nil
+        n = n_bits.to_i32
         byte = @pos >> 3
         v = @storage.unsafe_fetch(byte).to_u64 | (bits << (@pos & 7))
         (@storage.to_unsafe + byte).as(Pointer(UInt64)).value = v
-        @pos &+= n_bits
+        @pos &+= n
       end
 
-      def write_bits(n_bits : Int32, bits : Int32) : Nil
+      def write_bits(n_bits : Int, bits : Int) : Nil
         write_bits(n_bits, bits.to_u64!)
-      end
-
-      def write_bits(n_bits : Int32, bits : UInt16) : Nil
-        write_bits(n_bits, bits.to_u64)
-      end
-
-      def write_bits(n_bits : Int32, bits : UInt32) : Nil
-        write_bits(n_bits, bits.to_u64)
       end
 
       # array[pos >> 3] = 0; call before writing at a byte-aligned position.

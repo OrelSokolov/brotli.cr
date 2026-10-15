@@ -25,6 +25,9 @@ require "./brotli/enc/bit_writer"
 require "./brotli/enc/params"
 require "./brotli/enc/command"
 require "./brotli/enc/entropy_encode"
+require "./brotli/enc/bit_stream"
+require "./brotli/enc/compress_fragment"
+require "./brotli/enc/encoder"
 
 module Brotli
   VERSION = "0.1.0" # keep in sync with shard.yml
