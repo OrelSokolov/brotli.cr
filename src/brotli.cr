@@ -32,6 +32,7 @@ require "./brotli/enc/compress_fragment_two_pass"
 require "./brotli/enc/encoder_dict"
 require "./brotli/enc/static_dict"
 require "./brotli/enc/hashers"
+require "./brotli/enc/backward_references"
 require "./brotli/enc/encoder"
 
 module Brotli
