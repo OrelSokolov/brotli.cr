@@ -625,5 +625,522 @@ module Brotli
         jump_to_byte_boundary(w)
       end
     end
+
+    # ------------------------------------------------------------------
+    # q4+ pipeline (brotli_bit_stream.c: block switches, context maps,
+    # BlockEncoder, StoreMetaBlock). Base64 histogram specials are E6.
+
+    # brotli_bit_stream.c:34
+    private def self.block_length_prefix_code(len : Int32) : Int32
+      code = len >= 177 ? (len >= 753 ? 20 : 14) : (len >= 41 ? 7 : 0)
+      while code < Brotli::NUM_BLOCK_LEN_SYMBOLS - 1 &&
+            len >= Brotli::PREFIX_CODE_RANGES[code + 1][0]
+        code += 1
+      end
+      code
+    end
+
+    # brotli_bit_stream.c:41
+    private def self.get_block_length_prefix_code(len : Int32)
+      code = block_length_prefix_code(len)
+      {code, Brotli::PREFIX_CODE_RANGES[code][1], len - Brotli::PREFIX_CODE_RANGES[code][0]}
+    end
+
+    # brotli_bit_stream.c:48
+    class BlockTypeCodeCalculator
+      property last_type : Int32
+      property second_last_type : Int32
+
+      def initialize
+        @last_type = 1
+        @second_last_type = 0
+      end
+
+      def next_block_type_code(type : Int32) : Int32
+        type_code = type == @last_type + 1 ? 1 :
+                    type == @second_last_type ? 0 : type + 2
+        @second_last_type = @last_type
+        @last_type = type
+        type_code
+      end
+    end
+
+    # brotli_bit_stream.c:106 — stores a number between 0 and 255.
+    private def self.store_var_len_uint8(n : Int32, w : BitWriter) : Nil
+      if n == 0
+        w.write_bits(1, 0)
+      else
+        nbits = log2_floor_non_zero(n)
+        w.write_bits(1, 1)
+        w.write_bits(3, nbits)
+        w.write_bits(nbits, n - (1 << nbits))
+      end
+    end
+
+    # brotli_bit_stream.c:97
+    class BlockSplitCode
+      property type_code_calculator : BlockTypeCodeCalculator
+      property type_depths : Bytes
+      property type_bits : Slice(UInt16)
+      property length_depths : Bytes
+      property length_bits : Slice(UInt16)
+
+      def initialize
+        @type_code_calculator = BlockTypeCodeCalculator.new
+        @type_depths = Bytes.new(Brotli::MAX_BLOCK_TYPE_SYMBOLS)
+        @type_bits = Slice(UInt16).new(Brotli::MAX_BLOCK_TYPE_SYMBOLS)
+        @length_depths = Bytes.new(Brotli::NUM_BLOCK_LEN_SYMBOLS)
+        @length_bits = Slice(UInt16).new(Brotli::NUM_BLOCK_LEN_SYMBOLS)
+      end
+    end
+
+    # brotli_bit_stream.c:737
+    def self.store_block_switch(code : BlockSplitCode, block_len : Int32,
+                                        block_type : Int32,
+                                        is_first_block : Bool,
+                                        w : BitWriter) : Nil
+      typecode = code.type_code_calculator
+                 .next_block_type_code(block_type)
+      unless is_first_block
+        w.write_bits(code.type_depths[typecode],
+                     code.type_bits[typecode].to_u64)
+      end
+      lencode, len_nextra, len_extra = get_block_length_prefix_code(block_len)
+      w.write_bits(code.length_depths[lencode],
+                   code.length_bits[lencode].to_u64)
+      w.write_bits(len_nextra, len_extra)
+    end
+
+    # brotli_bit_stream.c:760
+    def self.build_and_store_block_split_code(
+        types : Array(UInt8), lengths : Array(UInt32), num_blocks : Int32,
+        num_types : Int32, tree : Slice(HuffmanTree), code : BlockSplitCode,
+        w : BitWriter) : Nil
+      type_histo = Slice(UInt32).new(num_types + 2)
+      length_histo = Slice(UInt32).new(Brotli::NUM_BLOCK_LEN_SYMBOLS)
+      calculator = code.type_code_calculator
+      i = 0
+      while i < num_blocks
+        type_code = calculator.next_block_type_code(types.unsafe_fetch(i))
+        type_histo[type_code] &+= 1 if i != 0
+        length_histo[block_length_prefix_code(lengths.unsafe_fetch(i).to_i32)] &+= 1
+        i += 1
+      end
+      store_var_len_uint8(num_types - 1, w)
+      if num_types > 1
+        build_and_store_huffman_tree(type_histo, num_types + 2, num_types + 2,
+                                     tree, code.type_depths, code.type_bits, w)
+        build_and_store_huffman_tree(length_histo,
+                                     Brotli::NUM_BLOCK_LEN_SYMBOLS,
+                                     Brotli::NUM_BLOCK_LEN_SYMBOLS, tree,
+                                     code.length_depths, code.length_bits, w)
+        store_block_switch(code, lengths.unsafe_fetch(0).to_i32,
+                           types.unsafe_fetch(0).to_i32, true, w)
+      end
+    end
+
+    # brotli_bit_stream.c:794
+    private def self.store_trivial_context_map(
+        num_types : Int32, context_bits : Int32,
+        tree : Slice(HuffmanTree), arena : ContextMapArena,
+        w : BitWriter) : Nil
+      store_var_len_uint8(num_types - 1, w)
+      return if num_types <= 1
+      repeat_code = context_bits - 1
+      repeat_bits = (1 << repeat_code) - 1
+      alphabet_size = num_types + repeat_code
+      histogram = arena.histogram
+      depths = arena.depths
+      bits = arena.bits
+      histogram.fill(0_u32, 0, alphabet_size)
+      # Write RLEMAX.
+      w.write_bits(1, 1)
+      w.write_bits(4, repeat_code - 1)
+      histogram[repeat_code] = num_types.to_u32!
+      histogram[0] = 1_u32
+      i = context_bits
+      while i < alphabet_size
+        histogram[i] = 1_u32
+        i += 1
+      end
+      build_and_store_huffman_tree(histogram, alphabet_size, alphabet_size,
+                                   tree, depths, bits, w)
+      i = 0
+      while i < num_types
+        code = i == 0 ? 0 : i + context_bits - 1
+        w.write_bits(depths[code], bits[code].to_u64)
+        w.write_bits(depths[repeat_code], bits[repeat_code].to_u64)
+        w.write_bits(repeat_code, repeat_bits)
+        i += 1
+      end
+      # Write IMTF (inverse-move-to-front) bit.
+      w.write_bits(1, 1)
+    end
+
+    # brotli_bit_stream.c:575/583/592
+    private def self.index_of(v : Bytes, v_size : Int32, value : UInt8) : Int32
+      i = 0
+      while i < v_size
+        return i if v.unsafe_fetch(i) == value
+        i += 1
+      end
+      i
+    end
+
+    private def self.move_to_front(v : Bytes, index : Int32) : Nil
+      value = v.unsafe_fetch(index)
+      i = index
+      while i != 0
+        v[i] = v.unsafe_fetch(i - 1)
+        i -= 1
+      end
+      v[0] = value
+    end
+
+    private def self.move_to_front_transform(v_in : Slice(UInt32),
+                                             v_size : Int32,
+                                             v_out : Slice(UInt32)) : Nil
+      return if v_size == 0
+      mtf = Bytes.new(256)
+      max_value = v_in.unsafe_fetch(0)
+      i = 1
+      while i < v_size
+        max_value = v_in.unsafe_fetch(i) if v_in.unsafe_fetch(i) > max_value
+        i += 1
+      end
+      i = 0
+      while i <= max_value
+        mtf[i] = i.to_u8!
+        i += 1
+      end
+      mtf_size = max_value + 1
+      i = 0
+      while i < v_size
+        index = index_of(mtf, mtf_size.to_i32, v_in.unsafe_fetch(i).to_u8!)
+        v_out[i] = index.to_u32!
+        move_to_front(mtf, index)
+        i += 1
+      end
+    end
+
+    # brotli_bit_stream.c:626
+    private def self.run_length_code_zeros(
+        in_size : Int32, v : Slice(UInt32),
+        max_run_length_prefix : Pointer(Int32)) : Int32
+      max_reps = 0_u32
+      i = 0
+      while i < in_size
+        while i < in_size && v.unsafe_fetch(i) != 0
+          i += 1
+        end
+        reps = 0_u32
+        while i < in_size && v.unsafe_fetch(i) == 0
+          reps &+= 1
+          i += 1
+        end
+        max_reps = Math.max(reps, max_reps)
+      end
+      max_prefix = max_reps > 0 ? log2_floor_non_zero(max_reps) : 0
+      max_prefix = Math.min(max_prefix, max_run_length_prefix.value)
+      max_run_length_prefix.value = max_prefix
+      out_size = 0
+      i = 0
+      while i < in_size
+        if v.unsafe_fetch(i) != 0
+          v[out_size] = v.unsafe_fetch(i) &+ max_prefix.to_u32!
+          i += 1
+          out_size += 1
+        else
+          reps = 1_u32
+          k = i + 1
+          while k < in_size && v.unsafe_fetch(k) == 0
+            reps &+= 1
+            k += 1
+          end
+          i += reps
+          while reps != 0
+            if reps < (2_u32 << max_prefix)
+              run_length_prefix = log2_floor_non_zero(reps)
+              extra_bits = reps - (1_u32 << run_length_prefix)
+              v[out_size] = run_length_prefix.to_u32! &+ (extra_bits << 9)
+              out_size += 1
+              break
+            else
+              extra_bits = (1_u32 << max_prefix) - 1
+              v[out_size] = max_prefix.to_u32! &+ (extra_bits << 9)
+              reps &-= (2_u32 << max_prefix) &- 1
+              out_size += 1
+            end
+          end
+        end
+      end
+      out_size
+    end
+
+    # brotli_bit_stream.c:677
+    class ContextMapArena
+      property histogram : Slice(UInt32)
+      property depths : Bytes
+      property bits : Slice(UInt16)
+
+      def initialize
+        @histogram = Slice(UInt32).new(Brotli::MAX_CONTEXT_MAP_SYMBOLS)
+        @depths = Bytes.new(Brotli::MAX_CONTEXT_MAP_SYMBOLS)
+        @bits = Slice(UInt16).new(Brotli::MAX_CONTEXT_MAP_SYMBOLS)
+      end
+    end
+
+    private SYMBOL_BITS = 9
+
+    # brotli_bit_stream.c:683
+    private def self.encode_context_map(arena : ContextMapArena,
+                                        context_map : Slice(UInt32),
+                                        context_map_size : Int32,
+                                        num_clusters : Int32,
+                                        tree : Slice(HuffmanTree),
+                                        w : BitWriter) : Nil
+      store_var_len_uint8(num_clusters - 1, w)
+      return if num_clusters == 1
+
+      rle_symbols = Slice(UInt32).new(context_map_size)
+      move_to_front_transform(context_map, context_map_size, rle_symbols)
+      mrlp = Pointer(Int32).malloc(1, 6)
+      num_rle_symbols = run_length_code_zeros(context_map_size, rle_symbols,
+                                              mrlp)
+      max_run_length_prefix = mrlp.value
+      symbol_mask = (1_u32 << SYMBOL_BITS) - 1
+      histogram = arena.histogram
+      histogram.fill(0)
+      i = 0
+      while i < num_rle_symbols
+        histogram[rle_symbols.unsafe_fetch(i) & symbol_mask] &+= 1
+        i += 1
+      end
+      use_rle = max_run_length_prefix > 0
+      w.write_bits(1, use_rle ? 1 : 0)
+      w.write_bits(4, max_run_length_prefix - 1) if use_rle
+      build_and_store_huffman_tree(
+        histogram, num_clusters + max_run_length_prefix,
+        num_clusters + max_run_length_prefix, tree, arena.depths,
+        arena.bits, w)
+      i = 0
+      while i < num_rle_symbols
+        rle_symbol = rle_symbols.unsafe_fetch(i) & symbol_mask
+        extra_bits_val = rle_symbols.unsafe_fetch(i) >> SYMBOL_BITS
+        w.write_bits(arena.depths[rle_symbol],
+                     arena.bits[rle_symbol].to_u64)
+        if rle_symbol > 0 && rle_symbol <= max_run_length_prefix
+          w.write_bits(rle_symbol, extra_bits_val)
+        end
+        i += 1
+      end
+      w.write_bits(1, 1) # use move-to-front
+    end
+
+    # brotli_bit_stream.c:832
+    class BlockEncoder
+      property histogram_length : Int32
+      property num_block_types : Int32
+      property block_types : Array(UInt8)
+      property block_lengths : Array(UInt32)
+      property num_blocks : Int32
+      property block_split_code : BlockSplitCode
+      property block_ix : Int32
+      property block_len : Int32
+      property entropy_ix : Int32
+      property depths : Bytes
+      property bits : Slice(UInt16)
+
+      def initialize(@histogram_length, @num_block_types,
+                     @block_types, @block_lengths, @num_blocks)
+        @block_split_code = BlockSplitCode.new
+        @block_ix = 0
+        @block_len = @num_blocks == 0 ? 0 : @block_lengths[0].to_i32
+        @entropy_ix = 0
+        @depths = Bytes.new(0)
+        @bits = Slice(UInt16).new(0)
+      end
+
+      # brotli_bit_stream.c:870
+      def build_and_store_block_switch_entropy_codes(tree : Slice(HuffmanTree),
+                                                     w : BitWriter) : Nil
+        Enc.build_and_store_block_split_code(@block_types, @block_lengths,
+                                              @num_blocks, @num_block_types,
+                                              tree, @block_split_code, w)
+      end
+
+      # block_encoder_inc.h:8 (base64 histogram specials not ported).
+      def build_and_store_entropy_codes(histograms : Array(Histogram),
+                                        alphabet_size : Int32,
+                                        tree : Slice(HuffmanTree),
+                                        w : BitWriter) : Nil
+        table_size = histograms.size * @histogram_length
+        @depths = Bytes.new(table_size)
+        @bits = Slice(UInt16).new(table_size)
+        histograms.each_with_index do |h, i|
+          ix = i * @histogram_length
+          Enc.build_and_store_huffman_tree(h.data, @histogram_length,
+                                           alphabet_size, tree,
+                                           @depths + ix, @bits + ix, w)
+        end
+      end
+
+      # brotli_bit_stream.c:879
+      def store_symbol(symbol : Int32, w : BitWriter) : Nil
+        if @block_len == 0
+          @block_ix += 1
+          block_ix = @block_ix
+          block_len = @block_lengths[block_ix].to_i32
+          block_type = @block_types[block_ix].to_i32
+          @block_len = block_len
+          @entropy_ix = block_type * @histogram_length
+          Enc.store_block_switch(@block_split_code, block_len, block_type,
+                                 false, w)
+        end
+        @block_len -= 1
+        ix = @entropy_ix + symbol
+        w.write_bits(@depths[ix], @bits[ix].to_u64)
+      end
+
+      # brotli_bit_stream.c:900
+      def store_symbol_with_context(symbol : Int32, context : Int32,
+                                    context_map : Slice(UInt32),
+                                    context_bits : Int32,
+                                    w : BitWriter) : Nil
+        if @block_len == 0
+          @block_ix += 1
+          block_ix = @block_ix
+          block_len = @block_lengths[block_ix].to_i32
+          block_type = @block_types[block_ix].to_i32
+          @block_len = block_len
+          @entropy_ix = block_type << context_bits
+          Enc.store_block_switch(@block_split_code, block_len, block_type,
+                                 false, w)
+        end
+        @block_len -= 1
+        histo_ix = context_map[@entropy_ix + context]
+        ix = histo_ix * @histogram_length + symbol
+        w.write_bits(@depths[ix], @bits[ix].to_u64)
+      end
+    end
+
+    # brotli_bit_stream.c:947 — BrotliStoreMetaBlock.
+    def self.store_meta_block(arena : MetablockArena,
+                              context_map_arena : ContextMapArena,
+                              input : Bytes, start_pos : Int32,
+                              length : Int32, mask : Int32,
+                              prev_byte : UInt8, prev_byte2 : UInt8,
+                              is_last : Bool, params : Params,
+                              literal_context_mode : Int32,
+                              commands : Array(Command),
+                              mb : MetaBlockSplit, w : BitWriter) : Nil
+      pos = start_pos
+      num_distance_symbols = params.dist.alphabet_size_max.to_i32
+      num_effective_distance_symbols = params.dist.alphabet_size_limit.to_i32
+      tree = arena.tree
+
+      store_compressed_meta_block_header(is_last, length, w)
+
+      literal_enc = BlockEncoder.new(Brotli::NUM_LITERAL_SYMBOLS,
+                                     mb.literal_split.num_types,
+                                     mb.literal_split.types,
+                                     mb.literal_split.lengths,
+                                     mb.literal_split.num_blocks)
+      command_enc = BlockEncoder.new(Brotli::NUM_COMMAND_SYMBOLS,
+                                     mb.command_split.num_types,
+                                     mb.command_split.types,
+                                     mb.command_split.lengths,
+                                     mb.command_split.num_blocks)
+      distance_enc = BlockEncoder.new(num_effective_distance_symbols,
+                                      mb.distance_split.num_types,
+                                      mb.distance_split.types,
+                                      mb.distance_split.lengths,
+                                      mb.distance_split.num_blocks)
+
+      literal_enc.build_and_store_block_switch_entropy_codes(tree, w)
+      command_enc.build_and_store_block_switch_entropy_codes(tree, w)
+      distance_enc.build_and_store_block_switch_entropy_codes(tree, w)
+
+      w.write_bits(2, params.dist.distance_postfix_bits)
+      w.write_bits(4, params.dist.num_direct_distance_codes >>
+                   params.dist.distance_postfix_bits)
+      mb.literal_split.num_types.times do
+        w.write_bits(2, literal_context_mode)
+      end
+
+      if (lcmap = mb.literal_context_map)
+        encode_context_map(context_map_arena, lcmap, lcmap.size,
+                           mb.literal_histograms.size, tree, w)
+      else
+        store_trivial_context_map(mb.literal_histograms.size,
+                                  Brotli::LITERAL_CONTEXT_BITS, tree,
+                                  context_map_arena, w)
+      end
+
+      if (dcmap = mb.distance_context_map)
+        encode_context_map(context_map_arena, dcmap, dcmap.size,
+                           mb.distance_histograms.size, tree, w)
+      else
+        store_trivial_context_map(mb.distance_histograms.size,
+                                  Brotli::DISTANCE_CONTEXT_BITS, tree,
+                                  context_map_arena, w)
+      end
+
+      literal_enc.build_and_store_entropy_codes(mb.literal_histograms,
+                                                Brotli::NUM_LITERAL_SYMBOLS,
+                                                tree, w)
+      command_enc.build_and_store_entropy_codes(mb.command_histograms,
+                                                Brotli::NUM_COMMAND_SYMBOLS,
+                                                tree, w)
+      distance_enc.build_and_store_entropy_codes(mb.distance_histograms,
+                                                 num_distance_symbols, tree, w)
+
+      commands.each do |cmd|
+        command_enc.store_symbol(cmd.cmd_prefix, w)
+        store_command_extra(cmd, w)
+        if (lcmap = mb.literal_context_map)
+          j = cmd.insert_len
+          while j != 0
+            context = CONTEXT_LOOKUP.unsafe_fetch(
+              ((literal_context_mode & 3) << 9) | prev_byte).to_i32 |
+              CONTEXT_LOOKUP.unsafe_fetch(
+                ((literal_context_mode & 3) << 9) | 256 | prev_byte2).to_i32
+            literal = input.unsafe_fetch(pos & mask)
+            literal_enc.store_symbol_with_context(literal, context, lcmap,
+                                                  Brotli::LITERAL_CONTEXT_BITS,
+                                                  w)
+            prev_byte2 = prev_byte
+            prev_byte = literal
+            pos += 1
+            j -= 1
+          end
+        else
+          j = cmd.insert_len
+          while j != 0
+            literal_enc.store_symbol(input.unsafe_fetch(pos & mask), w)
+            pos += 1
+            j -= 1
+          end
+        end
+        pos += cmd.copy_len
+        if cmd.copy_len != 0
+          prev_byte2 = input.unsafe_fetch((pos - 2) & mask)
+          prev_byte = input.unsafe_fetch((pos - 1) & mask)
+          if cmd.cmd_prefix >= 128
+            dist_code = (cmd.dist_prefix & 0x3FF).to_i32
+            distnumextra = cmd.dist_prefix >> 10
+            if (dcmap = mb.distance_context_map)
+              context = cmd.distance_context.to_i32
+              distance_enc.store_symbol_with_context(
+                dist_code, context, dcmap, Brotli::DISTANCE_CONTEXT_BITS, w)
+            else
+              distance_enc.store_symbol(dist_code, w)
+            end
+            w.write_bits(distnumextra, cmd.dist_extra)
+          end
+        end
+      end
+      jump_to_byte_boundary(w) if is_last
+    end
   end
 end

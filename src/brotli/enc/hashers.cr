@@ -66,6 +66,52 @@ module Brotli
       end
     end
 
+    # hash.h:80 — extends the 4-entry distance cache with the derived
+    # +/-1/2/3 candidates the hashers probe (indices 4..15).
+    def self.prepare_distance_cache(distance_cache : Slice(Int32),
+                                    num_distances : Int32) : Nil
+      return unless num_distances > 4
+      last_distance = distance_cache.unsafe_fetch(0)
+      distance_cache[4] = last_distance &- 1
+      distance_cache[5] = last_distance &+ 1
+      distance_cache[6] = last_distance &- 2
+      distance_cache[7] = last_distance &+ 2
+      distance_cache[8] = last_distance &- 3
+      distance_cache[9] = last_distance &+ 3
+      if num_distances > 10
+        next_last_distance = distance_cache.unsafe_fetch(1)
+        distance_cache[10] = next_last_distance &- 1
+        distance_cache[11] = next_last_distance &+ 1
+        distance_cache[12] = next_last_distance &- 2
+        distance_cache[13] = next_last_distance &+ 2
+        distance_cache[14] = next_last_distance &- 3
+        distance_cache[15] = next_last_distance &+ 3
+      end
+    end
+
+    # The hasher interface consumed by create_backward_references
+    # (C accesses it through the Hasher vtable; here it is a module).
+    module Hasher
+      abstract def hash_type_length : Int32
+      abstract def store_lookahead : Int32
+      abstract def prepare(data : Bytes, one_shot : Bool, input_size : Int32) : Nil
+      abstract def store(data : Bytes, mask : Int32, ix : Int32) : Nil
+      abstract def store_range(data : Bytes, mask : Int32, ix_start : Int32,
+                               ix_end : Int32) : Nil
+      abstract def stitch_to_previous_block(num_bytes : Int32, position : Int32,
+                                            ringbuffer : Bytes,
+                                            ringbuffer_mask : Int32) : Nil
+      abstract def prepare_distance_cache(distance_cache : Slice(Int32)) : Nil
+      abstract def find_longest_match(dict : EncoderDictionary, data : Bytes,
+                                      ring_buffer_mask : Int32,
+                                      distance_cache : Slice(Int32),
+                                      cur_ix : Int32, max_length : Int32,
+                                      max_backward : Int32,
+                                      dictionary_distance : Int32,
+                                      max_distance : Int32,
+                                      sr : HasherSearchResult) : Nil
+    end
+
     # hash_base.h:23 — Hash14.
     def self.hash14(data : Bytes, pos : Int32) : UInt32
       v = (data.to_unsafe + pos).as(Pointer(UInt32)).value
@@ -133,6 +179,8 @@ module Brotli
     # instantiates H2/H3/H4/H54 (bucket bits / sweep bits / hash length /
     # dictionary use).
     class QuicklyHasher
+      include Hasher
+
       getter buckets : Slice(UInt32)
       getter common : HasherCommon
       @bucket_bits : Int32
@@ -168,6 +216,14 @@ module Brotli
 
       def self.h54 : QuicklyHasher
         new(20, 2, 7, false)
+      end
+
+      def hash_type_length : Int32
+        8
+      end
+
+      def store_lookahead : Int32
+        8
       end
 
       # hash_longest_match_quickly_inc.h:56
@@ -342,6 +398,436 @@ module Brotli
                                       max_length, dictionary_distance,
                                       max_distance, sr, true)
         end
+      end
+    end
+
+    # Port of hash_longest_match_inc.h (H5, 32-bit hash) and
+    # hash_longest_match64_inc.h (H6, 64-bit hash, 8-byte type length).
+    # Bucket/block sizes come from HasherParams (ChooseHasher).
+    class LongestMatchHasher
+      include Hasher
+
+      getter common : HasherCommon
+      @bucket_bits : Int32
+      @bucket_size : Int32
+      @block_size : Int32
+      @block_mask : UInt32
+      @block_bits : Int32
+      @num_last_distances_to_check : Int32
+      @use_64 : Bool
+      @num : Slice(UInt16)
+      @buckets : Slice(UInt32)
+
+      def initialize(bucket_bits : Int32, block_bits : Int32,
+                     num_last_distances_to_check : Int32, use_64 : Bool)
+        @bucket_bits = bucket_bits
+        @bucket_size = 1 << bucket_bits
+        @block_size = 1 << block_bits
+        @block_mask = (@block_size - 1).to_u32!
+        @block_bits = block_bits
+        @num_last_distances_to_check = num_last_distances_to_check
+        @use_64 = use_64
+        @num = Slice(UInt16).new(@bucket_size)
+        @buckets = Slice(UInt32).new(@bucket_size * @block_size)
+        @common = HasherCommon.new
+      end
+
+      def hash_type_length : Int32
+        @use_64 ? 8 : 4
+      end
+
+      def store_lookahead : Int32
+        @use_64 ? 8 : 4
+      end
+
+      # hash_longest_match_inc.h:23 / hash_longest_match64_inc.h:24
+      private def hash_bytes(data : Bytes, pos : Int32) : Int32
+        key = if @use_64
+                v = (data.to_unsafe + pos).as(Pointer(UInt64)).value
+                hash_mul = K_HASH_MUL64 << (64 &- 5 &* 8)
+                ((v &* hash_mul) >> (64 &- 15)).to_i32!
+              else
+                v = (data.to_unsafe + pos).as(Pointer(UInt32)).value
+                ((v &* StaticDict::HASH_MUL32) >>
+                 (32 &- @bucket_bits)).to_i32!
+              end
+        key
+      end
+
+      # hash_longest_match_inc.h:74
+      def prepare(data : Bytes, one_shot : Bool, input_size : Int32) : Nil
+        # Partial preparation is 100 times slower (per socket).
+        partial_prepare_threshold = @bucket_size >> 6
+        if one_shot && input_size <= partial_prepare_threshold
+          i = 0
+          while i < input_size
+            @num[hash_bytes(data, i)] = 0
+            i += 1
+          end
+        else
+          @num.fill(0)
+        end
+      end
+
+      # hash_longest_match_inc.h:104
+      def store(data : Bytes, mask : Int32, ix : Int32) : Nil
+        key = hash_bytes(data, ix & mask)
+        minor_ix = @num.unsafe_fetch(key) & @block_mask
+        offset = minor_ix &+ (key.to_u32! << @block_bits)
+        @num[key] = @num.unsafe_fetch(key) &+ 1
+        @buckets[offset] = ix.to_u32!
+      end
+
+      # hash_longest_match_inc.h:116
+      def store_range(data : Bytes, mask : Int32, ix_start : Int32,
+                      ix_end : Int32) : Nil
+        i = ix_start
+        while i < ix_end
+          store(data, mask, i)
+          i += 1
+        end
+      end
+
+      # hash_longest_match_inc.h:125
+      def stitch_to_previous_block(num_bytes : Int32, position : Int32,
+                                   ringbuffer : Bytes,
+                                   ringbuffer_mask : Int32) : Nil
+        if num_bytes >= hash_type_length - 1 && position >= 3
+          store(ringbuffer, ringbuffer_mask, position - 3)
+          store(ringbuffer, ringbuffer_mask, position - 2)
+          store(ringbuffer, ringbuffer_mask, position - 1)
+        end
+      end
+
+      # hash_longest_match_inc.h:139
+      def prepare_distance_cache(distance_cache : Slice(Int32)) : Nil
+        Enc.prepare_distance_cache(distance_cache,
+                                   @num_last_distances_to_check)
+      end
+
+      # hash_longest_match_inc.h:156
+      def find_longest_match(dict : EncoderDictionary, data : Bytes,
+                             ring_buffer_mask : Int32,
+                             distance_cache : Slice(Int32),
+                             cur_ix : Int32, max_length : Int32,
+                             max_backward : Int32,
+                             dictionary_distance : Int32,
+                             max_distance : Int32,
+                             sr : HasherSearchResult) : Nil
+        num = @num
+        buckets = @buckets
+        cur_ix_masked = cur_ix & ring_buffer_mask
+        min_score = sr.score
+        best_score = sr.score
+        best_len = sr.len
+        key = hash_bytes(data, cur_ix_masked)
+        bucket_offset = (key << @block_bits).to_i32!
+        sr.len = 0
+        sr.len_code_delta = 0
+
+        # Try last distance first.
+        i = 0
+        while i < @num_last_distances_to_check
+          backward = distance_cache.unsafe_fetch(i)
+          prev_ix = cur_ix &- backward
+          i += 1
+          next if prev_ix >= cur_ix || backward > max_backward
+          prev_ix &= ring_buffer_mask
+          break if cur_ix_masked &+ best_len > ring_buffer_mask
+          if prev_ix &+ best_len > ring_buffer_mask ||
+             data.unsafe_fetch(cur_ix_masked &+ best_len) !=
+               data.unsafe_fetch(prev_ix &+ best_len)
+            next
+          end
+          len = Enc.find_match_length_with_limit(data, prev_ix,
+                                                 cur_ix_masked, max_length)
+          if len >= 3 || (len == 2 && i <= 2)
+            score = Enc.backward_reference_score_using_last_distance(len)
+            if best_score < score
+              score &-= Enc.backward_reference_penalty_using_last_distance(
+                i - 1) if i != 1
+              if best_score < score
+                best_score = score
+                best_len = len
+                sr.len = best_len
+                sr.distance = backward
+                sr.score = best_score
+              end
+            end
+          end
+        end
+        # We require matches of len > 4, so increase best_len to 3, so we
+        # can compare 4 bytes all the time.
+        best_len = 3 if best_len < 3
+
+        num_key = num.unsafe_fetch(key)
+        down = num_key > @block_size ? num_key - @block_size : 0
+        i = num_key
+        while i > down
+          i -= 1
+          prev_ix = buckets.unsafe_fetch(
+            (i & @block_mask) &+ bucket_offset).to_i32!
+          backward = cur_ix &- prev_ix
+          break if backward > max_backward
+          prev_ix &= ring_buffer_mask
+          break if cur_ix_masked &+ best_len > ring_buffer_mask
+          if prev_ix &+ best_len > ring_buffer_mask ||
+             read_u32(data, cur_ix_masked &+ best_len &- 3) !=
+               read_u32(data, prev_ix &+ best_len &- 3)
+            next
+          end
+          len = Enc.find_match_length_with_limit(data, prev_ix,
+                                                 cur_ix_masked, max_length)
+          if len >= 4
+            score = Enc.backward_reference_score(len, backward)
+            if best_score < score
+              best_score = score
+              best_len = len
+              sr.len = best_len
+              sr.distance = backward
+              sr.score = best_score
+            end
+          end
+        end
+        buckets[(num_key & @block_mask) &+ bucket_offset] = cur_ix.to_u32!
+        num[key] = num_key &+ 1
+
+        if min_score == sr.score
+          Enc.search_in_static_dictionary(dict, @common, data,
+                                          cur_ix_masked, max_length,
+                                          dictionary_distance, max_distance,
+                                          sr, false)
+        end
+      end
+
+      private def read_u32(data : Bytes, pos : Int32) : UInt32
+        (data.to_unsafe + pos).as(Pointer(UInt32)).value
+      end
+    end
+
+    # Port of hash_forgetful_chain_inc.h (H40/H41/H42 instantiations;
+    # BUCKET_BITS 15, CAPPED_CHAINS 0).
+    class ForgetfulChainHasher
+      include Hasher
+
+      getter common : HasherCommon
+      @bucket_size : Int32
+      @num_banks : Int32
+      @bank_size : Int32
+      @bank_mask : Int32
+      @num_last_distances_to_check : Int32
+      @max_hops : Int32
+      @addr : Slice(UInt32)
+      @head : Slice(UInt16)
+      @tiny_hash : Slice(UInt8)
+      @free_slot_idx : Slice(UInt16)
+      @bank_delta : Slice(UInt16)
+      @bank_next : Slice(UInt16)
+
+      def initialize(num_last_distances_to_check : Int32, num_banks : Int32,
+                     bank_bits : Int32, quality : Int32)
+        @bucket_size = 1 << 15 # BUCKET_BITS
+        @num_banks = num_banks
+        @bank_size = 1 << bank_bits
+        @bank_mask = @bank_size - 1
+        @num_last_distances_to_check = num_last_distances_to_check
+        @max_hops = (quality > 6 ? 7 : 8) << (quality - 4)
+        @addr = Slice(UInt32).new(@bucket_size)
+        @head = Slice(UInt16).new(@bucket_size)
+        @tiny_hash = Slice(UInt8).new(65536)
+        @free_slot_idx = Slice(UInt16).new(num_banks)
+        @bank_delta = Slice(UInt16).new(num_banks * @bank_size)
+        @bank_next = Slice(UInt16).new(num_banks * @bank_size)
+        @common = HasherCommon.new
+      end
+
+      def self.h40(quality : Int32) : ForgetfulChainHasher
+        new(4, 1, 16, quality)
+      end
+
+      def self.h41(quality : Int32) : ForgetfulChainHasher
+        new(10, 1, 16, quality)
+      end
+
+      def self.h42(quality : Int32) : ForgetfulChainHasher
+        new(16, 512, 9, quality)
+      end
+
+      def hash_type_length : Int32
+        4
+      end
+
+      def store_lookahead : Int32
+        4
+      end
+
+      # hash_forgetful_chain_inc.h:31
+      private def hash_bytes(data : Bytes, pos : Int32) : Int32
+        v = (data.to_unsafe + pos).as(Pointer(UInt32)).value
+        ((v &* StaticDict::HASH_MUL32) >> (32 &- 15)).to_i32!
+      end
+
+      # hash_forgetful_chain_inc.h:93
+      def prepare(data : Bytes, one_shot : Bool, input_size : Int32) : Nil
+        partial_prepare_threshold = @bucket_size >> 6
+        if one_shot && input_size <= partial_prepare_threshold
+          i = 0
+          while i < input_size
+            bucket = hash_bytes(data, i)
+            # See InitEmpty comment.
+            @addr[bucket] = 0xCCCCCCCC_u32
+            @head[bucket] = 0xCCCC
+            i += 1
+          end
+        else
+          # Fill addr with 0xCCCCCCCC: because of wrapping, the position
+          # processed by the hasher never reaches 3GB + 64M, so every new
+          # chain terminates after the first node.
+          @addr.fill(0xCCCCCCCC_u32)
+          @head.fill(0)
+        end
+        @tiny_hash.fill(0)
+        @free_slot_idx.fill(0)
+      end
+
+      # hash_forgetful_chain_inc.h:133
+      def store(data : Bytes, mask : Int32, ix : Int32) : Nil
+        key = hash_bytes(data, ix & mask)
+        bank = key & (@num_banks - 1)
+        idx = @free_slot_idx.unsafe_fetch(bank) & @bank_mask
+        @free_slot_idx[bank] = @free_slot_idx.unsafe_fetch(bank) &+ 1
+        # C: size_t delta = ix - addr[key] (wraps when addr is the sentinel).
+        delta = (ix.to_u64! &- @addr.unsafe_fetch(key))
+        delta = 0xFFFF_u64 if delta > 0xFFFF
+        @tiny_hash[ix & 0xFFFF] = key.to_u8!
+        slot = (bank &* @bank_size) &+ idx
+        @bank_delta[slot] = delta.to_u16!
+        @bank_next[slot] = @head.unsafe_fetch(key)
+        @addr[key] = ix.to_u32!
+        @head[key] = idx.to_u16!
+      end
+
+      # hash_forgetful_chain_inc.h:151
+      def store_range(data : Bytes, mask : Int32, ix_start : Int32,
+                      ix_end : Int32) : Nil
+        i = ix_start
+        while i < ix_end
+          store(data, mask, i)
+          i += 1
+        end
+      end
+
+      # hash_forgetful_chain_inc.h:161
+      def stitch_to_previous_block(num_bytes : Int32, position : Int32,
+                                   ringbuffer : Bytes,
+                                   ringbuffer_mask : Int32) : Nil
+        if num_bytes >= hash_type_length - 1 && position >= 3
+          store(ringbuffer, ringbuffer_mask, position - 3)
+          store(ringbuffer, ringbuffer_mask, position - 2)
+          store(ringbuffer, ringbuffer_mask, position - 1)
+        end
+      end
+
+      # hash_forgetful_chain_inc.h:175
+      def prepare_distance_cache(distance_cache : Slice(Int32)) : Nil
+        Enc.prepare_distance_cache(distance_cache,
+                                   @num_last_distances_to_check)
+      end
+
+      # hash_forgetful_chain_inc.h:193
+      def find_longest_match(dict : EncoderDictionary, data : Bytes,
+                             ring_buffer_mask : Int32,
+                             distance_cache : Slice(Int32),
+                             cur_ix : Int32, max_length : Int32,
+                             max_backward : Int32,
+                             dictionary_distance : Int32,
+                             max_distance : Int32,
+                             sr : HasherSearchResult) : Nil
+        cur_ix_masked = cur_ix & ring_buffer_mask
+        min_score = sr.score
+        best_score = sr.score
+        best_len = sr.len
+        key = hash_bytes(data, cur_ix_masked)
+        tiny_hash = key.to_u8!
+        sr.len = 0
+        sr.len_code_delta = 0
+
+        # Try last distance first.
+        i = 0
+        while i < @num_last_distances_to_check
+          backward = distance_cache.unsafe_fetch(i)
+          prev_ix = cur_ix &- backward
+          i += 1
+          # For distance code 0 we want to consider 2-byte matches.
+          next if i - 1 > 0 &&
+                  @tiny_hash.unsafe_fetch(prev_ix & 0xFFFF) != tiny_hash
+          next if prev_ix >= cur_ix || backward > max_backward
+          prev_ix &= ring_buffer_mask
+          len = Enc.find_match_length_with_limit(data, prev_ix,
+                                                 cur_ix_masked, max_length)
+          if len >= 2
+            score = Enc.backward_reference_score_using_last_distance(len)
+            if best_score < score
+              score &-= Enc.backward_reference_penalty_using_last_distance(
+                i - 1) if i != 1
+              if best_score < score
+                best_score = score
+                best_len = len
+                sr.len = best_len
+                sr.distance = backward
+                sr.score = best_score
+              end
+            end
+          end
+        end
+        best_len = 3 if best_len < 3
+
+        bank = key & (@num_banks - 1)
+        backward = 0_u64
+        hops = @max_hops
+        delta = cur_ix.to_u64! &- @addr.unsafe_fetch(key)
+        slot = @head.unsafe_fetch(key).to_i32
+        while hops > 0
+          hops -= 1
+          last = slot
+          backward &+= delta
+          break if backward > max_backward
+          prev_ix = (cur_ix &- backward.to_i32!) & ring_buffer_mask
+          slot = @bank_next.unsafe_fetch((bank &* @bank_size) &+
+                                         last).to_i32
+          delta = @bank_delta.unsafe_fetch((bank &* @bank_size) &+
+                                           last).to_u64
+          if cur_ix_masked &+ best_len > ring_buffer_mask ||
+             prev_ix &+ best_len > ring_buffer_mask ||
+             read_u32(data, cur_ix_masked &+ best_len &- 3) !=
+               read_u32(data, prev_ix &+ best_len &- 3)
+            next
+          end
+          len = Enc.find_match_length_with_limit(data, prev_ix,
+                                                 cur_ix_masked, max_length)
+          if len >= 4
+            score = Enc.backward_reference_score(len, backward.to_i32!)
+            if best_score < score
+              best_score = score
+              best_len = len
+              sr.len = best_len
+              sr.distance = backward.to_i32!
+              sr.score = best_score
+            end
+          end
+        end
+        store(data, ring_buffer_mask, cur_ix)
+
+        if sr.score == min_score
+          Enc.search_in_static_dictionary(dict, @common, data,
+                                          cur_ix_masked, max_length,
+                                          dictionary_distance, max_distance,
+                                          sr, false)
+        end
+      end
+
+      private def read_u32(data : Bytes, pos : Int32) : UInt32
+        (data.to_unsafe + pos).as(Pointer(UInt32)).value
       end
     end
   end

@@ -48,7 +48,7 @@ module Brotli
                                         position_offset : Int32,
                                         data : Bytes, mask : Int32,
                                         params : Params,
-                                        hasher : QuicklyHasher,
+                                        hasher : Hasher,
                                         dict : EncoderDictionary,
                                         dist_cache : Slice(Int32),
                                         last_insert_len : Int32,
@@ -58,7 +58,8 @@ module Brotli
 
       insert_length = last_insert_len
       pos_end = position &+ num_bytes
-      store_end = num_bytes >= 8 ? position &+ num_bytes &- 8 &+ 1 : position
+      lookahead = hasher.store_lookahead
+      store_end = num_bytes >= lookahead ? position &+ num_bytes &- lookahead &+ 1 : position
 
       # For speed-up heuristics for random data.
       random_heuristics_window_size =
@@ -72,7 +73,7 @@ module Brotli
       num_literals = 0
       pos = position
 
-      while pos &+ 8 < pos_end
+      while pos &+ hasher.hash_type_length < pos_end
         max_length = pos_end &- pos
         max_distance = Math.min(pos, max_backward_limit)
         dictionary_start = Math.min(pos &+ position_offset,
@@ -107,7 +108,7 @@ module Brotli
               sr = sr2
               delayed_backward_references_in_row &+= 1
               break unless delayed_backward_references_in_row < 4 &&
-                            pos &+ 8 < pos_end
+                            pos &+ hasher.hash_type_length < pos_end
               max_length &-= 1
               next
             end
@@ -151,7 +152,7 @@ module Brotli
             if pos > apply_random_heuristics &+
                       4 &* random_heuristics_window_size
               # Going through uncompressible data, jump.
-              margin = Math.max(8 - 1, 4) # StoreLookahead() == 8
+              margin = Math.max(lookahead - 1, 4)
               pos_jump = Math.min(pos &+ 16, pos_end &- margin)
               while pos < pos_jump
                 hasher.store(data, mask, pos)
@@ -159,7 +160,7 @@ module Brotli
                 pos &+= 4
               end
             else
-              margin = Math.max(8 - 1, 2)
+              margin = Math.max(lookahead - 1, 2)
               pos_jump = Math.min(pos &+ 8, pos_end &- margin)
               while pos < pos_jump
                 hasher.store(data, mask, pos)

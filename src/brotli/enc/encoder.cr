@@ -33,6 +33,9 @@ module Brotli
 
       def encode(input : Bytes) : Bytes
         Enc.sanitize_params!(@params)
+        # encode.c:1343 — the one-shot API advertises the input size; it
+        # steers ChooseHasher (q4 H54 for >= 1MiB) and context modeling.
+        @params.size_hint = input.size.to_u32!
         @params.lgblock = Enc.compute_lg_block(@params)
         Enc.choose_hasher(@params, @params.hasher)
         choose_distance_params
@@ -43,9 +46,11 @@ module Brotli
           encode_fast(input, one_pass: false)
         when .<(MIN_QUALITY_FOR_BLOCK_SPLIT)
           encode_blocks(input)
+        when .<(MIN_QUALITY_FOR_HQ_BLOCK_SPLITTING)
+          encode_metablocks(input)
         else
           raise NotImplementedError.new(
-            "quality #{@params.quality} is not ported yet (phases E5+)")
+            "quality #{@params.quality} is not ported yet (phases E6+)")
         end
       end
 
@@ -174,8 +179,9 @@ module Brotli
         # decoder's distance ring buffer — short distance codes (0..15)
         # in later fragments reference it. Resetting per fragment would
         # desync them (C keeps s->dist_cache_ across EncodeData calls).
-        dist_cache = Slice(Int32).new(4)
-        dist_cache.copy_from(Slice[4, 11, 15, 16])
+        # 16 entries: PrepareDistanceCache fills indices 4..15.
+        dist_cache = Slice(Int32).new(Brotli::NUM_DISTANCE_SHORT_CODES)
+        dist_cache[0, 4].copy_from(Slice[4, 11, 15, 16])
 
         frag_pos = 0
         loop do
@@ -184,9 +190,10 @@ module Brotli
 
           # Ring buffer: the fragment padded to a power of two (mask needs
           # pow2; all positions stay below the ring end, no wrapping).
+          # +16 slack: hashers read past the logical end like the C tail.
           rb_bits = Math.max(log2_ceil(frag), 1)
           rb_size = 1 << rb_bits
-          rb = Bytes.new(rb_size)
+          rb = Bytes.new(rb_size + 16)
           rb[0, frag].copy_from(input[frag_pos, frag])
           mask = rb_size - 1
 
@@ -211,7 +218,7 @@ module Brotli
             while pos < frag
               block = Math.min(max_block, frag - pos)
               is_last_block = pos + block >= frag && is_last_fragment
-              saved_dist_cache = dist_cache.dup
+              saved_dist_cache = dist_cache[0, 4].dup
               commands = [] of Command
               last_insert_len, num_literals =
                 Enc.create_backward_references(block, pos, frag_pos, rb, mask,
@@ -241,7 +248,7 @@ module Brotli
                                                commands, w)
                 end
               else
-                dist_cache.copy_from(saved_dist_cache)
+                dist_cache[0, 4].copy_from(saved_dist_cache)
                 Enc.store_uncompressed_meta_block(is_last_block, rb, pos,
                                                   mask, block, w)
               end
@@ -252,6 +259,144 @@ module Brotli
             # Non-last fragments end byte-aligned by the stored metablocks;
             # if a fragment ended uncompressed non-last, no alignment is
             # needed beyond what store_uncompressed did.
+          end
+
+          out_bytes = w.pos >> 3
+          out.write(storage[0, out_bytes])
+          last_bytes = storage.unsafe_fetch(out_bytes).to_u16
+          last_bytes_bits = (w.pos & 7).to_u8!
+          break if is_last_fragment || frag == 0
+          frag_pos += frag
+        end
+        out.to_slice
+      end
+
+      # encode.c:507 WriteMetaBlockInternal + EncodeData flush, q4..q9 route:
+      # one metablock per window fragment (input blocks merge up to
+      # MaxMetablockSize, which always covers a fragment for lgwin <= 22).
+      # The HQ path (q10+) base64 regions and BrotliBuildMetaBlock are E6.
+      private def encode_metablocks(input : Bytes) : Bytes
+        lgwin = @params.lgwin
+        window = 1 << lgwin
+        dict = EncoderDictionary.default
+        literal_context_mode = 2 # CONTEXT_UTF8 (ChooseContextMode, q < 10)
+
+        last_bytes, last_bytes_bits = Enc.encode_window_bits(lgwin)
+        out = IO::Memory.new(input.size // 2 + 64)
+
+        # See encode_blocks: the distance cache is continuous across
+        # fragments, matching the decoder's ring buffer.
+        dist_cache = Slice(Int32).new(Brotli::NUM_DISTANCE_SHORT_CODES)
+        dist_cache[0, 4].copy_from(Slice[4, 11, 15, 16])
+
+        frag_pos = 0
+        loop do
+          frag = Math.min(input.size - frag_pos, window)
+          is_last_fragment = frag_pos + frag >= input.size
+
+          rb_bits = Math.max(log2_ceil(frag), 1)
+          rb_size = 1 << rb_bits
+          # +16 slack: hashers read up to 8 bytes past the logical end
+          # (StoreLookahead / compare tails), like the C ring buffer tail.
+          rb = Bytes.new(rb_size + 16)
+          rb[0, frag].copy_from(input[frag_pos, frag])
+          mask = rb_size - 1
+
+          hasher = case @params.hasher.type
+                   when 2 then QuicklyHasher.h2
+                   when 3 then QuicklyHasher.h3
+                   when 4 then QuicklyHasher.h4
+                   when 54 then QuicklyHasher.h54
+                   when 5
+                     LongestMatchHasher.new(@params.hasher.bucket_bits,
+                                            @params.hasher.block_bits,
+                                            @params.hasher.num_last_distances_to_check,
+                                            false)
+                   when 6
+                     LongestMatchHasher.new(@params.hasher.bucket_bits,
+                                            @params.hasher.block_bits,
+                                            @params.hasher.num_last_distances_to_check,
+                                            true)
+                   when 40 then ForgetfulChainHasher.h40(@params.quality)
+                   when 41 then ForgetfulChainHasher.h41(@params.quality)
+                   when 42 then ForgetfulChainHasher.h42(@params.quality)
+                   else
+                     raise NotImplementedError.new(
+                       "hasher type #{@params.hasher.type} is not ported yet")
+                   end
+          hasher.prepare(rb, true, frag)
+          arena = MetablockArena.new
+          context_map_arena = ContextMapArena.new
+
+          storage = Bytes.new(2 &* frag &+ 503)
+          storage[0] = (last_bytes & 0xFF).to_u8!
+          storage[1] = (last_bytes >> 8).to_u8!
+          w = BitWriter.new(storage, last_bytes_bits.to_i32)
+
+          if frag == 0
+            # Write the ISLAST and ISEMPTY bits.
+            w.write_bits(2, 3)
+            w.pos = (w.pos &+ 7) & ~7
+          else
+            # encode.c:1118: prev bytes come from before the flush position;
+            # at a fragment boundary that is the tail of the previous one.
+            prev_byte = frag_pos > 0 ? input.unsafe_fetch(frag_pos - 1) : 0_u8
+            prev_byte2 = frag_pos > 1 ? input.unsafe_fetch(frag_pos - 2) : 0_u8
+
+            saved_dist_cache = dist_cache[0, 4].dup
+            commands = [] of Command
+            last_insert_len, num_literals =
+              Enc.create_backward_references(frag, 0, frag_pos, rb, mask,
+                                             @params, hasher, dict,
+                                             dist_cache, 0, commands)
+            # Create the last insert-only command (encode.c:1181).
+            if last_insert_len > 0
+              commands << Command.insert(last_insert_len)
+              num_literals += last_insert_len
+            end
+
+            if should_compress?(rb, mask, 0, frag, num_literals, commands.size)
+              mb = MetaBlockSplit.new
+              num_literal_contexts = 1
+              literal_context_map = nil
+              unless @params.disable_literal_context_modeling
+                nctx = Pointer(Int32).malloc(1)
+                nctx.value = 1
+                lmap = Pointer(Slice(UInt32)).malloc(1)
+                lmap.value = Slice(UInt32).empty
+                Enc.decide_over_literal_context_modeling(
+                  rb, 0, frag, mask, @params.quality,
+                  @params.size_hint.to_i32!, nctx, lmap)
+                num_literal_contexts = nctx.value
+                literal_context_map = lmap.value
+              end
+              Enc.build_meta_block_greedy(rb, 0, mask, prev_byte, prev_byte2,
+                                          literal_context_mode,
+                                          num_literal_contexts,
+                                          literal_context_map, commands, mb)
+              if @params.quality >= MIN_QUALITY_FOR_OPTIMIZE_HISTOGRAMS
+                Enc.optimize_histograms(
+                  @params.dist.alphabet_size_limit.to_i32, mb)
+              end
+              Enc.store_meta_block(arena, context_map_arena, rb, 0, frag,
+                                   mask, prev_byte, prev_byte2,
+                                   is_last_fragment, @params,
+                                   literal_context_mode, commands, mb, w)
+              # encode.c:614 — the compressed form lost to a raw copy: roll
+              # back and emit the block uncompressed.
+              if frag + 4 < (w.pos >> 3)
+                dist_cache[0, 4].copy_from(saved_dist_cache)
+                storage[0] = (last_bytes & 0xFF).to_u8!
+                storage[1] = (last_bytes >> 8).to_u8!
+                w.pos = last_bytes_bits.to_i32
+                Enc.store_uncompressed_meta_block(is_last_fragment, rb, 0,
+                                                  mask, frag, w)
+              end
+            else
+              dist_cache[0, 4].copy_from(saved_dist_cache)
+              Enc.store_uncompressed_meta_block(is_last_fragment, rb, 0,
+                                                mask, frag, w)
+            end
           end
 
           out_bytes = w.pos >> 3
