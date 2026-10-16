@@ -541,8 +541,19 @@ diff_test 45/45. Ratio vs C: тексты q10/q11 в пределах +0.5%, н�
 −1.6%); Silesia суммарно q10 +3.68%, q11 +4.00% (в целевых ±5%; детали
 tmp/e6_notes.md).
 
-### E7. CLI `bin/brotli_encode` + `tools/encode_test.sh` (двойной roundtrip
-всех q на testdata/Silesia/шрифтах/ассетах; краевые: пусто, 1 байт, random,
->64MB, UTF8/binary) + отчёт ratio vs C.
+### E7. CLI + полный дифтест-корпус + отчёт ratio — ВЫПОЛНЕНО
+`bin/brotli_encode` (стиль brotli_decode: `[-q N] [-w lgwin] [-m
+generic|text|font]`, без output -> stdout, STDERR `OK <in> -> <out>
+(<insize> -> <outsize> bytes)`). Корпус: `tmp/edge/assets` (js/json/svg/
+css/utf8), `tmp/edge/big/big.bin` 105MB (>64MB: q0/q1 заворот окна
+2^18, q2/q9), `tmp/woff2` (173 бинарных шрифта). Драйвер
+`tools/encode_full_test.sh` (полная матрица, лог tmp/e7_full.log);
+`tools/encode_ratio.sh` — суммы vs C по качествам. Прогон: testdata 24,
+edge 7, assets 7, шрифты 173, Silesia 13 × q0..q11 + big.bin q0/q1/q2/q9
+— все двойные roundtrip зелёные; 56 spec, diff_test 45/45. Ratio (суммы):
+Silesia q0 −0.46% … q11 +4.00% (все |Δ| < 5%); testdata/assets на q4–q10
+почти побайтово равны C (кроме bb.binast — фрагментация окна vs
+непрерывное кольцо C; на q2/q3 мы на нём лучше C на 20%). Детали:
+tmp/e7_notes.md.
 
 ### E8. Производительность: цель ≤3x от C на q1/q5/q9 (q11 — зафиксировать).

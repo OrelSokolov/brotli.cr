@@ -1,0 +1,54 @@
+# brotli.cr CLI encoder.
+#
+# Usage:   brotli_encode <input> [output] [-q N] [-w lgwin] [-m mode]
+#          (no output arg -> stdout; mode: generic|text|font)
+# Exit:    0 success, 1 encode error, 3 usage error
+# stderr:  "OK <in> -> <out> (<insize> -> <outsize> bytes)" on success.
+
+require "../src/brotli"
+
+quality = 11
+lgwin = 22
+mode = Brotli::Enc::Mode::Generic
+files = [] of String
+
+i = 0
+while i < ARGV.size
+  case ARGV[i]
+  when "-q" then i += 1; quality = ARGV[i]?.try(&.to_i?) || (STDERR.puts "bad -q"; exit 3)
+  when "-w" then i += 1; lgwin = ARGV[i]?.try(&.to_i?) || (STDERR.puts "bad -w"; exit 3)
+  when "-m"
+    i += 1
+    case ARGV[i]?
+    when "generic" then mode = Brotli::Enc::Mode::Generic
+    when "text"    then mode = Brotli::Enc::Mode::Text
+    when "font"    then mode = Brotli::Enc::Mode::Font
+    else STDERR.puts "bad -m (generic|text|font)"; exit 3
+    end
+  else files << ARGV[i]
+  end
+  i += 1
+end
+
+if files.size < 1 || !(0..11).covers?(quality)
+  STDERR.puts "usage: #{PROGRAM_NAME} <input> [output] [-q N] [-w lgwin] [-m generic|text|font]"
+  exit 3
+end
+
+input = File.read(files[0])
+out_path = files[1]?
+
+begin
+  data = Brotli::Enc::Encoder.new(quality, lgwin, mode).encode(input.to_slice)
+  if out_path
+    File.write(out_path, data)
+  else
+    STDOUT.write(data)
+    STDOUT.flush
+  end
+  STDERR.puts "OK #{files[0]} -> #{out_path || "stdout"} (#{input.size} -> #{data.size} bytes)"
+  exit 0
+rescue e : Exception
+  STDERR.puts "ERROR #{e.class}: #{e.message}"
+  exit 1
+end
