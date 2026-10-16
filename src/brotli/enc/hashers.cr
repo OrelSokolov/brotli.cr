@@ -854,13 +854,13 @@ module Brotli
       end
 
       def length : Int32
-        @length_and_code >> 5
+        (@length_and_code >> 5).to_i32!
       end
 
       # 0 means "same as length".
       def length_code : Int32
         code = @length_and_code & 31
-        code == 0 ? length : code
+        code == 0 ? length : code.to_i32!
       end
     end
 
@@ -1028,7 +1028,7 @@ module Brotli
         dict_matches = Slice(UInt32).new(
           MAX_STATIC_DICTIONARY_MATCH_LEN + 1, K_INVALID_MATCH)
         minlen = Math.max(4, best_len + 1)
-        if Enc.find_all_static_dictionary_matches(
+        if StaticDict.find_all_static_dictionary_matches(
             dict, data, cur_ix_masked, minlen, max_length, dict_matches)
           maxlen = Math.min(MAX_STATIC_DICTIONARY_MATCH_LEN, max_length)
           l = minlen

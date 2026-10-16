@@ -348,7 +348,9 @@ module Brotli
         pairs = Slice(HistogramPair).new(max_num_pairs + 1) { HistogramPair.new }
       end
       clusters = Slice(UInt32).new(num_clusters) { |i2| i2.to_u32! }
-      cluster_size_slice = cluster_size.to_slice
+      cluster_size_slice = Slice(UInt32).new(cluster_size.size) do |i2|
+        cluster_size.unsafe_fetch(i2)
+      end
       num_final_clusters = histogram_combine(
         all_histograms, tmp[0], cluster_size_slice, histogram_symbols,
         clusters, pairs, num_clusters, num_blocks,

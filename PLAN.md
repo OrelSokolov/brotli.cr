@@ -501,8 +501,45 @@ roundtrip q0–q9 OK, 56 spec зелёные. Ratio vs C: текстовые ф�
 (alice29/lcet10/plrabn12/compressed_repeated), Silesia суммарно
 +0.6%…+2.5% (q5…q9, в целевых ±5%; детали tmp/e5_notes.md).
 
-### E6. HQ q10–q11: static_dict (reuse transform.cr), H10 binary tree,
-Zopfli DP (Float32!), BrotliBuildMetaBlock.
+### E6. HQ q10–q11 — ВЫПОЛНЕНО
+`enc/backward_references_hq.cr` (ZopfliNode, ZopfliCostModel c Float32-арифметикой,
+StartPosQueue(8), ComputeMinimumCopyLength/DistanceShortcut/DistanceCache,
+UpdateNodes, ZopfliIterate, q10 = ZopfliComputeShortestPath single-pass,
+q11 = HqZopfli двухфазный — вторая фаза с моделью SetFromCommands), H10
+BinaryTreeHasher (hash_to_binary_tree_inc.h, BUCKET_BITS=17,
+MAX_TREE_COMP_LENGTH=128, MAX_TREE_SEARCH_DEPTH=64; был написан ранее),
+`enc/metablock.cr`: BrotliBuildMetaBlock (сетка NPOSTFIX≤3/NDIRECT с
+ComputeDistanceCost, RecomputeDistancePrefixes, сплит + кластеризация до 256
+гистограмм на категорию), `enc/params.cr`: Params/DistanceParams#dup,
+encoder.cr: encode_hq (choose_context_mode UTF8/SIGNED, q10/q11 маршрутизация,
+uncompressed-фолбэк с откатом).
+
+Найденные баги при отладке:
+1) Crystal 1.21 bug: константа модуля, ссылающаяся на соседнюю константу
+   (constants.cr: CODE_LENGTH_CODES = REPEAT_ZERO_CODE_LENGTH + 1), падает
+   «undefined constant» при ПЕРВОМ разрешении из generic-позиции другого
+   файла (bit_cost.cr: StaticArray(UInt32, Brotli::CODE_LENGTH_CODES)).
+   До E6 путь population_cost не компилировался (мёртвый код E5), баг
+   всплыл при подключении кластеризации. Обход: literal 18 в generic-
+   позиции (значения в value-позиции работают). Репро: tmp/cbtest/.
+2) Command — struct: `cmds.unsafe_fetch(i)` даёт копию, мутации
+   dist_prefix/dist_extra в RecomputeDistancePrefixes терялись →
+   рассинхрон дистанций при npostfix>0 (FORMAT_BLOCK_LENGTH_1/-9 или
+   TRUNCATED). Фикс: `cmds[i] = cmd`.
+3) `x.step(to: x-1)` в Crystal итерирует ВНИЗ (0.step(to: -1) → [0, -1]):
+   SetFromCommands с 0 команд читал commands[-1] → segfault на мелких
+   файлах (x, xyzzy). Фикс: guard `return if num_commands <= 0`.
+4) Оживление мёртвого кода E5: cluster.cr (move_from → Pointer#move_from),
+   block_splitter.cr cluster_blocks (cluster_size Array→Slice),
+   histogram.cr BlockSplitIterator (UInt32→Int32 длины), static_dict.cr
+   (UInt32#min → Math.min), literal_cost.cr (байты → to_i32!).
+
+Тесты: encode_test q10/q11 testdata 24/24 (двойной roundtrip), Silesia
+13/13, краевые (пусто, 1 байт, abc-400K, random×2) OK, 56 spec,
+diff_test 45/45. Ratio vs C: тексты q10/q11 в пределах +0.5%, некоторые
+файлы лучше C (cp1251-utf16le −1.3%, mapsdatazrh −0.3%, bb.binast q11
+−1.6%); Silesia суммарно q10 +3.68%, q11 +4.00% (в целевых ±5%; детали
+tmp/e6_notes.md).
 
 ### E7. CLI `bin/brotli_encode` + `tools/encode_test.sh` (двойной roundtrip
 всех q на testdata/Silesia/шрифтах/ассетах; краевые: пусто, 1 байт, random,

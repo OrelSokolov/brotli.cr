@@ -77,14 +77,14 @@ module Brotli
       def initialize(@split : BlockSplit)
         @idx = 0
         @type = 0
-        @length = @split.lengths.empty? ? 0 : @split.lengths[0]
+        @length = @split.lengths.empty? ? 0 : @split.lengths[0].to_i32
       end
 
       def next : Nil
         if @length == 0
           @idx += 1
-          @type = @split.types[@idx]
-          @length = @split.lengths[@idx]
+          @type = @split.types[@idx].to_i32
+          @length = @split.lengths[@idx].to_i32
         end
         @length -= 1
       end

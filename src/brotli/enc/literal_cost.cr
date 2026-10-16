@@ -28,7 +28,7 @@ module Brotli
       last_c = 0
       i = 0
       while i < len
-        c = data.unsafe_fetch((pos &+ i) & mask)
+        c = data.unsafe_fetch((pos &+ i) & mask).to_i32!
         counts[utf8_position(last_c, c, 2)] &+= 1
         last_c = c
         i += 1
@@ -55,7 +55,7 @@ module Brotli
       utf8_pos = 0
       i = 0
       while i < in_window
-        c = data.unsafe_fetch((pos &+ i) & mask)
+        c = data.unsafe_fetch((pos &+ i) & mask).to_i32!
         histogram[256 &* utf8_pos &+ c] &+= 1
         in_window_utf8[utf8_pos] &+= 1
         utf8_pos = utf8_position(last_c, c, max_utf8)
@@ -69,9 +69,9 @@ module Brotli
         if i >= window_half
           # Remove a byte in the past.
           c = i < window_half + 1 ? 0 : data.unsafe_fetch(
-            (pos &+ i &- window_half &- 1) & mask)
+            (pos &+ i &- window_half &- 1) & mask).to_i32!
           last_c2 = i < window_half + 2 ? 0 : data.unsafe_fetch(
-            (pos &+ i &- window_half &- 2) & mask)
+            (pos &+ i &- window_half &- 2) & mask).to_i32!
           utf8_pos2 = utf8_position(last_c2, c, max_utf8)
           histogram[256 &* utf8_pos2 &+
                     data.unsafe_fetch((pos &+ i &- window_half) & mask)] &-= 1
@@ -79,15 +79,16 @@ module Brotli
         end
         if i &+ window_half < len
           # Add a byte in the future.
-          c = data.unsafe_fetch((pos &+ i &+ window_half &- 1) & mask)
-          last_c2 = data.unsafe_fetch((pos &+ i &+ window_half &- 2) & mask)
+          c = data.unsafe_fetch((pos &+ i &+ window_half &- 1) & mask).to_i32!
+          last_c2 = data.unsafe_fetch(
+            (pos &+ i &+ window_half &- 2) & mask).to_i32!
           utf8_pos2 = utf8_position(last_c2, c, max_utf8)
           histogram[256 &* utf8_pos2 &+
                     data.unsafe_fetch((pos &+ i &+ window_half) & mask)] &+= 1
           in_window_utf8[utf8_pos2] &+= 1
         end
-        c = i < 1 ? 0 : data.unsafe_fetch((pos &+ i &- 1) & mask)
-        last_c2 = i < 2 ? 0 : data.unsafe_fetch((pos &+ i &- 2) & mask)
+        c = i < 1 ? 0 : data.unsafe_fetch((pos &+ i &- 1) & mask).to_i32!
+        last_c2 = i < 2 ? 0 : data.unsafe_fetch((pos &+ i &- 2) & mask).to_i32!
         utf8_pos = utf8_position(last_c2, c, max_utf8)
         masked_pos = (pos &+ i) & mask
         histo = histogram.unsafe_fetch(256 &* utf8_pos &+

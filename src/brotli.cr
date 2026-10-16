@@ -38,6 +38,7 @@ require "./brotli/enc/encoder_dict"
 require "./brotli/enc/static_dict"
 require "./brotli/enc/hashers"
 require "./brotli/enc/backward_references"
+require "./brotli/enc/backward_references_hq"
 require "./brotli/enc/encoder"
 
 module Brotli

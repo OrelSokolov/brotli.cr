@@ -133,7 +133,9 @@ module Brotli
         i = 0
         while i < num_clusters
           if clusters.unsafe_fetch(i) == best_idx2
-            clusters.move_from(i + 1, i, num_clusters - i - 1)
+            # C: memmove(clusters+i, clusters+i+1, num_clusters-i-1 entries)
+            ptr = clusters.to_unsafe
+            (ptr + i).move_from(ptr + i + 1, num_clusters - i - 1)
             break
           end
           i += 1

@@ -52,7 +52,7 @@ module Brotli
       private def self.add_match(distance : Int32, len : Int32, len_code : Int32,
                                  matches : Slice(UInt32)) : Nil
         match = ((distance.to_u32! << 5) &+ len_code.to_u32!)
-        matches[len] = matches[len].min(match)
+        matches[len] = Math.min(matches.unsafe_fetch(len), match)
       end
 
       # static_dict.c:26

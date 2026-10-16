@@ -68,6 +68,24 @@ module Brotli
       property alphabet_size_max : UInt32 = 0
       property alphabet_size_limit : UInt32 = 0
       property max_distance : UInt64 = 0
+
+      def initialize
+      end
+
+      # Deep copy (used by BrotliBuildMetaBlock's parameter grid).
+      def dup : DistanceParams
+        d = DistanceParams.new
+        d.copy_from(self)
+        d
+      end
+
+      def copy_from(other : DistanceParams) : Nil
+        @distance_postfix_bits = other.distance_postfix_bits
+        @num_direct_distance_codes = other.num_direct_distance_codes
+        @alphabet_size_max = other.alphabet_size_max
+        @alphabet_size_limit = other.alphabet_size_limit
+        @max_distance = other.max_distance
+      end
     end
 
     class Params
@@ -82,6 +100,23 @@ module Brotli
       property dist : DistanceParams = DistanceParams.new
 
       def initialize(@quality : Int32 = MAX_QUALITY, @lgwin : Int32 = 22)
+      end
+
+      # Deep copy for WriteMetaBlockInternal's block_params (encode.c:530);
+      # dist is deep-copied because BuildMetaBlock retunes it in place.
+      def dup : Params
+        p = Params.new(@quality, @lgwin)
+        p.mode = @mode
+        p.lgblock = @lgblock
+        p.size_hint = @size_hint
+        p.disable_literal_context_modeling = @disable_literal_context_modeling
+        p.large_window = @large_window
+        p.hasher.type = @hasher.type
+        p.hasher.bucket_bits = @hasher.bucket_bits
+        p.hasher.block_bits = @hasher.block_bits
+        p.hasher.num_last_distances_to_check = @hasher.num_last_distances_to_check
+        p.dist = @dist.dup
+        p
       end
     end
 

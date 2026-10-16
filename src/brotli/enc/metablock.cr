@@ -318,6 +318,170 @@ module Brotli
       end
     end
 
+    # metablock.c:206 — RecomputeDistancePrefixes: rewrite the distance
+    # prefix/extra of every copy command for the new npostfix/ndirect.
+    def self.recompute_distance_prefixes(cmds : Array(Command),
+                                         num_commands : Int32,
+                                         orig_params : DistanceParams,
+                                         new_params : DistanceParams) : Nil
+      return if orig_params.distance_postfix_bits ==
+                new_params.distance_postfix_bits &&
+                orig_params.num_direct_distance_codes ==
+                new_params.num_direct_distance_codes
+      num_commands.times do |i|
+        cmd = cmds.unsafe_fetch(i)
+        if cmd.copy_len != 0 && cmd.cmd_prefix >= 128
+          distance = cmd.restore_distance_code(orig_params)
+          cmd.dist_prefix, cmd.dist_extra = Enc.prefix_encode_copy_distance(
+            distance.to_u64!, new_params.num_direct_distance_codes,
+            new_params.distance_postfix_bits)
+          cmds[i] = cmd # Command is a struct: write the copy back
+        end
+      end
+    end
+
+    # metablock.c:230 — {ok, cost} of recoding distances under new_params.
+    private def self.compute_distance_cost(cmds : Array(Command),
+                                           num_commands : Int32,
+                                           orig_params : DistanceParams,
+                                           new_params : DistanceParams) : {Bool, Float64}
+      equal_params = orig_params.distance_postfix_bits ==
+                     new_params.distance_postfix_bits &&
+                     orig_params.num_direct_distance_codes ==
+                     new_params.num_direct_distance_codes
+      tmp = Histogram.distance
+      extra_bits = 0.0
+      num_commands.times do |i|
+        cmd = cmds.unsafe_fetch(i)
+        next unless cmd.copy_len != 0 && cmd.cmd_prefix >= 128
+        if equal_params
+          dist_prefix = cmd.dist_prefix
+        else
+          distance = cmd.restore_distance_code(orig_params)
+          return {false, 0.0} if distance > new_params.max_distance
+          dist_prefix, _extra = Enc.prefix_encode_copy_distance(
+            distance.to_u64!, new_params.num_direct_distance_codes,
+            new_params.distance_postfix_bits)
+        end
+        tmp.add(dist_prefix & 0x3FF)
+        extra_bits += (dist_prefix >> 10)
+      end
+      {true, population_cost(tmp) + extra_bits}
+    end
+
+    # metablock.c:274 — BrotliBuildMetaBlock, the HQ path (q10+): tunes
+    # NPOSTFIX/NDIRECT over a grid, splits, builds histograms with literal
+    # contexts and clusters them (up to 256 histograms per category).
+    # `params.dist` is mutated to the winning distance parameters, as in C
+    # (the caller passes a copy of the encoder params). Base64 regions and
+    # compound dictionaries are out of scope.
+    def self.build_meta_block(ringbuffer : Bytes, pos : Int32, mask : Int32,
+                              params : Params, prev_byte : UInt8,
+                              prev_byte2 : UInt8,
+                              commands : Array(Command), num_commands : Int32,
+                              literal_context_mode : Int32,
+                              mb : MetaBlockSplit) : Nil
+      # Histogram ids need to fit in one byte.
+      max_number_of_histograms = 256
+      literal_context_multiplier = 1
+      ndirect_msb = 0_u32
+      check_orig = true
+      best_dist_cost = 1e99
+      orig_params = params.dist.dup
+      new_params = params.dist.dup
+
+      npostfix = 0_u32
+      while npostfix <= Brotli::MAX_NPOSTFIX
+        while ndirect_msb < 16
+          ndirect = ndirect_msb << npostfix
+          Enc.init_distance_params(new_params, npostfix, ndirect)
+          if npostfix == orig_params.distance_postfix_bits &&
+             ndirect == orig_params.num_direct_distance_codes
+            check_orig = false
+          end
+          ok, dist_cost = compute_distance_cost(commands, num_commands,
+                                                orig_params, new_params)
+          break if !ok || dist_cost > best_dist_cost
+          best_dist_cost = dist_cost
+          params.dist.copy_from(new_params)
+          ndirect_msb += 1
+        end
+        ndirect_msb -= 1 if ndirect_msb > 0
+        ndirect_msb //= 2
+        npostfix += 1
+      end
+      if check_orig
+        ok, dist_cost = compute_distance_cost(commands, num_commands,
+                                              orig_params, orig_params)
+        if dist_cost < best_dist_cost
+          params.dist.copy_from(orig_params)
+        end
+      end
+      recompute_distance_prefixes(commands, num_commands, orig_params,
+                                  params.dist)
+
+      Enc.split_block(commands[0, num_commands], ringbuffer, pos, mask,
+                      params.quality, mb.literal_split, mb.command_split,
+                      mb.distance_split)
+
+      literal_context_modes : Slice(Int32)? = nil
+      unless params.disable_literal_context_modeling
+        literal_context_multiplier = 1 << Brotli::LITERAL_CONTEXT_BITS
+        modes = Slice(Int32).new(mb.literal_split.num_types)
+        modes.fill(literal_context_mode)
+        literal_context_modes = modes
+      end
+
+      literal_histograms_size =
+        mb.literal_split.num_types * literal_context_multiplier
+      literal_histograms = Array(Histogram).new(literal_histograms_size) do
+        Histogram.literal
+      end
+      distance_histograms_size =
+        mb.distance_split.num_types << Brotli::DISTANCE_CONTEXT_BITS
+      distance_histograms = Array(Histogram).new(distance_histograms_size) do
+        Histogram.distance
+      end
+      mb.command_histograms = Array(Histogram).new(
+        mb.command_split.num_types) { Histogram.command }
+
+      build_histograms_with_context(
+        commands[0, num_commands], mb.literal_split, mb.command_split,
+        mb.distance_split, ringbuffer, pos, mask, prev_byte, prev_byte2,
+        literal_context_modes, literal_histograms, mb.command_histograms,
+        distance_histograms)
+
+      mb.literal_context_map = Slice(UInt32).new(
+        mb.literal_split.num_types << Brotli::LITERAL_CONTEXT_BITS)
+      literal_out = Array(Histogram).new(mb.literal_context_map.not_nil!.size) do
+        Histogram.literal
+      end
+      literal_histograms_size = cluster_histograms(
+        literal_histograms, max_number_of_histograms, literal_out,
+        mb.literal_context_map.not_nil!)
+      mb.literal_histograms = literal_out[0, literal_histograms_size]
+
+      if params.disable_literal_context_modeling
+        # Distribute assignment to all contexts.
+        lcmap = mb.literal_context_map.not_nil!
+        (mb.literal_split.num_types - 1).downto(0) do |i|
+          Brotli::LITERAL_CONTEXT_BITS.times do |j|
+            lcmap[(i << Brotli::LITERAL_CONTEXT_BITS) &+ j] =
+              lcmap.unsafe_fetch(i)
+          end
+        end
+      end
+
+      mb.distance_context_map = Slice(UInt32).new(distance_histograms_size)
+      distance_out = Array(Histogram).new(distance_histograms_size) do
+        Histogram.distance
+      end
+      distance_histograms_size = cluster_histograms(
+        distance_histograms, max_number_of_histograms, distance_out,
+        mb.distance_context_map.not_nil!)
+      mb.distance_histograms = distance_out[0, distance_histograms_size]
+    end
+
     # metablock.c:841 — BrotliOptimizeHistograms.
     def self.optimize_histograms(num_distance_codes : Int32,
                                  mb : MetaBlockSplit) : Nil

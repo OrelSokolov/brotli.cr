@@ -79,7 +79,11 @@ module Brotli
         # Entropy of the histogram plus a simplified code-length-code
         # histogram estimate (zero repeat code 17 only).
         max_depth = 1
-        depth_histo = StaticArray(UInt32, Brotli::CODE_LENGTH_CODES).new(0_u32)
+        # Crystal 1.21 bug: a module constant that references a sibling
+        # constant fails to initialize when first resolved in a generic type
+        # argument position (StaticArray(UInt32, Brotli::CODE_LENGTH_CODES));
+        # use the literal value, value-position uses below are fine.
+        depth_histo = StaticArray(UInt32, 18).new(0_u32) # CODE_LENGTH_CODES
         bits = 0.0
         log2total = fast_log2(histogram.total_count)
         i = 0
