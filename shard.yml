@@ -1,9 +1,10 @@
 name: brotli
-version: 0.2.0
+version: 0.3.0
 description: |
-  Brotli decoder (RFC 7932) in pure Crystal, ported from google/brotli
-  (c/dec). Decoder only — for WOFF2 font decoding. The reference C
-  decoder is used as a test oracle only.
+  Brotli decoder + encoder (RFC 7932) in pure Crystal, ported from
+  google/brotli (c/dec, c/enc). Decoder — for WOFF2 font decoding;
+  encoder — quality 0..11, one-shot API (Brotli.encode). The reference
+  C implementation is used as a test oracle only.
 license: MIT
 authors:
   - Oleg Orlov <orelcokolov@gmail.com>
