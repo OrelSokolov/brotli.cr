@@ -472,8 +472,10 @@ module Brotli
       # hash_longest_match_inc.h:104
       def store(data : Bytes, mask : Int32, ix : Int32) : Nil
         key = hash_bytes(data, ix & mask)
-        minor_ix = @num.unsafe_fetch(key) & @block_mask
-        offset = minor_ix &+ (key.to_u32! << @block_bits)
+        # NB: index math must stay Int32 — UInt16 receiver type of num[] would
+        # truncate (UInt16 &+ UInt32 evaluates in UInt16) and split buckets.
+        minor_ix = @num.unsafe_fetch(key).to_i32! & @block_mask
+        offset = minor_ix &+ (key << @block_bits)
         @num[key] = @num.unsafe_fetch(key) &+ 1
         @buckets[offset] = ix.to_u32!
       end
@@ -561,12 +563,13 @@ module Brotli
         best_len = 3 if best_len < 3
 
         num_key = num.unsafe_fetch(key)
-        down = num_key > @block_size ? num_key - @block_size : 0
-        i = num_key
+        down = num_key.to_i32! > @block_size ? num_key.to_i32! - @block_size : 0
+        i = num_key.to_i32!
         while i > down
           i -= 1
+          # Int32 index math — see store() for the UInt16 truncation pitfall.
           prev_ix = buckets.unsafe_fetch(
-            (i & @block_mask) &+ bucket_offset).to_i32!
+            (i & @block_mask).to_i32! &+ bucket_offset).to_i32!
           backward = cur_ix &- prev_ix
           break if backward > max_backward
           prev_ix &= ring_buffer_mask
@@ -589,7 +592,7 @@ module Brotli
             end
           end
         end
-        buckets[(num_key & @block_mask) &+ bucket_offset] = cur_ix.to_u32!
+        buckets[(num_key.to_i32! & @block_mask) &+ bucket_offset] = cur_ix.to_u32!
         num[key] = num_key &+ 1
 
         if min_score == sr.score
@@ -828,6 +831,270 @@ module Brotli
 
       private def read_u32(data : Bytes, pos : Int32) : UInt32
         (data.to_unsafe + pos).as(Pointer(UInt32)).value
+      end
+    end
+
+    # hash.h:212 — a backward match candidate (dictionary matches also carry
+    # a length code in the low 5 bits).
+    struct BackwardMatch
+      property distance : UInt32
+      property length_and_code : UInt32
+
+      def initialize(@distance = 0_u32, @length_and_code = 0_u32)
+      end
+
+      def self.init_match(distance : Int32, length : Int32) : BackwardMatch
+        new(distance.to_u32!, (length << 5).to_u32!)
+      end
+
+      def self.init_dictionary_match(distance : Int32, length : Int32,
+                                     length_code : Int32) : BackwardMatch
+        new(distance.to_u32!,
+            ((length << 5) | length_code).to_u32!)
+      end
+
+      def length : Int32
+        @length_and_code >> 5
+      end
+
+      # 0 means "same as length".
+      def length_code : Int32
+        code = @length_and_code & 31
+        code == 0 ? length : code
+      end
+    end
+
+    # Port of hash_to_binary_tree_inc.h (H10 instantiation: BUCKET_BITS 17,
+    # MAX_TREE_COMP_LENGTH 128, MAX_TREE_SEARCH_DEPTH 64).
+    # Each hash bucket holds a binary tree of sequences sharing the 4-byte
+    # hash, lexicographically sorted and max-heap by start position.
+    class BinaryTreeHasher
+      MAX_TREE_COMP_LENGTH = 128
+      MAX_TREE_SEARCH_DEPTH = 64
+      MAX_NUM_MATCHES_H10 = MAX_TREE_SEARCH_DEPTH + 64
+
+      getter common : HasherCommon
+      @window_mask : Int32
+      @invalid_pos : Int32
+      @buckets : Slice(Int32)
+      @forest : Slice(Int32)
+
+      def initialize(lgwin : Int32, num_nodes : Int32)
+        # C: one_shot with input_size < 2^lgwin shrinks the forest.
+        @window_mask = (1 << lgwin) - 1
+        # (uint32_t)(0 - window_mask) as signed.
+        @invalid_pos = -@window_mask
+        @buckets = Slice(Int32).new(1 << 17, @invalid_pos)
+        @forest = Slice(Int32).new(2 * num_nodes)
+        @common = HasherCommon.new
+      end
+
+      def hash_type_length : Int32
+        4
+      end
+
+      def store_lookahead : Int32
+        MAX_TREE_COMP_LENGTH
+      end
+
+      # hash_to_binary_tree_inc.h:27
+      private def hash_bytes(data : Bytes, pos : Int32) : Int32
+        v = (data.to_unsafe + pos).as(Pointer(UInt32)).value
+        ((v &* StaticDict::HASH_MUL32) >> (32 &- 17)).to_i32!
+      end
+
+      # hash_to_binary_tree_inc.h:67
+      def prepare(data : Bytes, one_shot : Bool, input_size : Int32) : Nil
+        @buckets.fill(@invalid_pos)
+      end
+
+      def left_child_index(pos : Int32) : Int32
+        2 &* (pos & @window_mask)
+      end
+
+      def right_child_index(pos : Int32) : Int32
+        2 &* (pos & @window_mask) &+ 1
+      end
+
+      # hash_to_binary_tree_inc.h:114 — stores the hash of the next 4 bytes
+      # and, in a single tree traversal, searches the bucket's tree for
+      # matches and re-roots it at the current position. Returns
+      # {best_len, match_count}; matches/mpos are unused when matches is nil.
+      def store_and_find_matches(data : Bytes, cur_ix : Int32,
+                                 ring_buffer_mask : Int32, max_length : Int32,
+                                 max_backward : Int32, best_len_in : Int32,
+                                 matches : Slice(BackwardMatch)?,
+                                 mpos_in : Int32) : {Int32, Int32}
+        cur_ix_masked = cur_ix & ring_buffer_mask
+        max_comp_len = Math.min(max_length, MAX_TREE_COMP_LENGTH)
+        should_reroot_tree = max_length >= MAX_TREE_COMP_LENGTH
+        key = hash_bytes(data, cur_ix_masked)
+        buckets = @buckets
+        forest = @forest
+        prev_ix = buckets.unsafe_fetch(key)
+        best_len = best_len_in
+        mpos = mpos_in
+        # Forest index of the rightmost node of the left subtree of the new
+        # root, and the leftmost node of the right subtree.
+        node_left = left_child_index(cur_ix)
+        node_right = right_child_index(cur_ix)
+        best_len_left = 0
+        best_len_right = 0
+        buckets[key] = cur_ix if should_reroot_tree
+        depth_remaining = MAX_TREE_SEARCH_DEPTH
+        loop do
+          backward = cur_ix &- prev_ix
+          prev_ix_masked = prev_ix & ring_buffer_mask
+          if backward == 0 || backward > max_backward || depth_remaining == 0
+            if should_reroot_tree
+              forest[node_left] = @invalid_pos
+              forest[node_right] = @invalid_pos
+            end
+            break
+          end
+          cur_len = Math.min(best_len_left, best_len_right)
+          len = cur_len &+ Enc.find_match_length_with_limit(
+            data, cur_ix_masked &+ cur_len, prev_ix_masked &+ cur_len,
+            max_length &- cur_len)
+          if matches && len > best_len
+            best_len = len
+            matches[mpos] = BackwardMatch.init_match(backward, len)
+            mpos += 1
+          end
+          if len >= max_comp_len
+            if should_reroot_tree
+              forest[node_left] = forest.unsafe_fetch(
+                left_child_index(prev_ix))
+              forest[node_right] = forest.unsafe_fetch(
+                right_child_index(prev_ix))
+            end
+            break
+          end
+          if data.unsafe_fetch(cur_ix_masked &+ len) >
+             data.unsafe_fetch(prev_ix_masked &+ len)
+            best_len_left = len
+            forest[node_left] = prev_ix if should_reroot_tree
+            node_left = right_child_index(prev_ix)
+            prev_ix = forest.unsafe_fetch(node_left)
+          else
+            best_len_right = len
+            forest[node_right] = prev_ix if should_reroot_tree
+            node_right = left_child_index(prev_ix)
+            prev_ix = forest.unsafe_fetch(node_right)
+          end
+          depth_remaining -= 1
+        end
+        {best_len, mpos}
+      end
+
+      # hash_to_binary_tree_inc.h:202 — all matches at cur_ix, sorted by
+      # strictly increasing length and non-strictly increasing distance.
+      def find_all_matches(dict : EncoderDictionary, data : Bytes,
+                           ring_buffer_mask : Int32, cur_ix : Int32,
+                           max_length : Int32, max_backward : Int32,
+                           dictionary_distance : Int32, params : Params,
+                           matches : Slice(BackwardMatch)) : Int32
+        mpos = 0
+        cur_ix_masked = cur_ix & ring_buffer_mask
+        best_len = 1
+        short_match_max_backward =
+          params.quality != HQ_ZOPFLIFICATION_QUALITY ? 16 : 64
+        stop = cur_ix - short_match_max_backward
+        stop = 0 if cur_ix < short_match_max_backward
+        i = cur_ix - 1
+        while i > stop && best_len <= 2
+          prev_ix = i
+          backward = cur_ix - prev_ix
+          break if backward > max_backward
+          prev_ix &= ring_buffer_mask
+          if data.unsafe_fetch(cur_ix_masked) == data.unsafe_fetch(prev_ix) &&
+             data.unsafe_fetch(cur_ix_masked &+ 1) ==
+               data.unsafe_fetch(prev_ix &+ 1)
+            len = Enc.find_match_length_with_limit(data, prev_ix,
+                                                   cur_ix_masked, max_length)
+            if len > best_len
+              best_len = len
+              matches[mpos] = BackwardMatch.init_match(backward, len)
+              mpos += 1
+            end
+          end
+          i -= 1
+        end
+        if best_len < max_length
+          best_len, mpos = store_and_find_matches(
+            data, cur_ix, ring_buffer_mask, max_length, max_backward,
+            best_len, matches, mpos)
+        end
+        dict_matches = Slice(UInt32).new(
+          MAX_STATIC_DICTIONARY_MATCH_LEN + 1, K_INVALID_MATCH)
+        minlen = Math.max(4, best_len + 1)
+        if Enc.find_all_static_dictionary_matches(
+            dict, data, cur_ix_masked, minlen, max_length, dict_matches)
+          maxlen = Math.min(MAX_STATIC_DICTIONARY_MATCH_LEN, max_length)
+          l = minlen
+          while l <= maxlen
+            dict_id = dict_matches.unsafe_fetch(l)
+            if dict_id < K_INVALID_MATCH
+              distance = dictionary_distance &+ (dict_id >> 5).to_i32 &+ 1
+              if distance <= params.dist.max_distance
+                matches[mpos] = BackwardMatch.init_dictionary_match(
+                  distance, l, (dict_id & 31).to_i32)
+                mpos += 1
+              end
+            end
+            l += 1
+          end
+        end
+        mpos
+      end
+
+      # hash_to_binary_tree_inc.h:271
+      def store(data : Bytes, mask : Int32, ix : Int32) : Nil
+        # Maximum distance is window size - 16, see section 9.1 of the spec.
+        max_backward = @window_mask &- Brotli::WINDOW_GAP &+ 1
+        store_and_find_matches(data, ix, mask, MAX_TREE_COMP_LENGTH,
+                               max_backward, 0, nil, 0)
+      end
+
+      # hash_to_binary_tree_inc.h:280
+      def store_range(data : Bytes, mask : Int32, ix_start : Int32,
+                      ix_end : Int32) : Nil
+        i = ix_start
+        j = ix_start
+        i = ix_end - 63 if ix_start &+ 63 <= ix_end
+        if ix_start &+ 512 <= i
+          while j < i
+            store(data, mask, j)
+            j += 8
+          end
+        end
+        while i < ix_end
+          store(data, mask, i)
+          i += 1
+        end
+      end
+
+      # hash_to_binary_tree_inc.h:298
+      def stitch_to_previous_block(num_bytes : Int32, position : Int32,
+                                   ringbuffer : Bytes,
+                                   ringbuffer_mask : Int32) : Nil
+        if num_bytes >= hash_type_length - 1 &&
+           position >= MAX_TREE_COMP_LENGTH
+          # Store the last MAX_TREE_COMP_LENGTH - 1 positions in the hasher.
+          i_start = position - MAX_TREE_COMP_LENGTH + 1
+          i_end = Math.min(position, i_start &+ num_bytes)
+          i = i_start
+          while i < i_end
+            # Don't look further back from the start of the next block than
+            # the window size, otherwise we could access overwritten areas.
+            max_backward = @window_mask &- Math.max(
+              Brotli::WINDOW_GAP &- 1, position &- i)
+            store_and_find_matches(ringbuffer, i, ringbuffer_mask,
+                                   MAX_TREE_COMP_LENGTH, max_backward, 0,
+                                   nil, 0)
+            i += 1
+          end
+        end
       end
     end
   end

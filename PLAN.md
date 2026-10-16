@@ -478,9 +478,28 @@ last_bytes переносится между фрагментами.
 q2 538 vs 25: нет длинных RLE-матчей вне блоков, задокументировано),
 Silesia q2/q3 12/12 roundtrip.
 
-### E5. Конвейер q4–q9: histogram/bit_cost/cluster/block_splitter/metablock/
-bit_stream (BlockEncoder, EncodeContextMap), H5/H6, H40–42, merge-or-emit,
-uncompressed-фолбэк с откатом. Чекпоинт: Silesia q4–q9 roundtrip + ratio.
+### E5. Конвейер q4–q9 — ВЫПОЛНЕНО
+`enc/histogram.cr`, `enc/bit_cost.cr`, `enc/cluster.cr`, `enc/block_splitter.cr`,
+`enc/metablock.cr` (BuildMetaBlockGreedy, ContextBlockSplitter,
+DecideOverLiteralContextModeling, OptimizeHistograms), `enc/literal_cost.cr`,
+`enc/bit_stream.cr`: BlockEncoder + StoreMetaBlock + EncodeContextMap (MTF+RLE),
+`enc/hashers.cr`: H5/H6 (longest match), H40–42 (forgetful chain),
+encoder.cr: encode_metablocks (один метаблок на фрагмент окна,
+uncompressed-фолбэк `frag + 4 < w.pos >> 3` с откатом dist_cache/storage).
+Найденный баг порта (критичный для ratio): в LongestMatchHasher индекс бакета
+`(i & block_mask) &+ bucket_offset` вычислялся в UInt16 (у Crystal битовые/
+арифметические операторы сохраняют тип приёмника: UInt16 & UInt32 → UInt16) и
+обрезал `key << block_bits` (до 8 МБ) по модулю 65536 — записи и чтения цепей
+ходили в согласованные но ЧУЖИЕ слоты: поток валиден, но матчи терялись
+(compressed_repeated q9 давал 100523 вместо 50443, тексты q9 ~+14%).
+Фикс: вся индексация бакетов в Int32 (store/find_longest_match).
+Диагностика: инструментированная копия C-энкодера `tmp_c/enc_dbg`
+(BR_ENC_TRACE=1 печатает команды CreateBackwardReferences).
+Тесты: encode_test q4–q9 testdata 24/24 (двойной roundtrip), Silesia q4–q9
+13/13, краевые (пусто, 1 байт, abc-400K, random ×2) OK, lgwin=16 (H40/41/42)
+roundtrip q0–q9 OK, 56 spec зелёные. Ratio vs C: текстовые файлы q4/q9 побайтово равны C
+(alice29/lcet10/plrabn12/compressed_repeated), Silesia суммарно
++0.6%…+2.5% (q5…q9, в целевых ±5%; детали tmp/e5_notes.md).
 
 ### E6. HQ q10–q11: static_dict (reuse transform.cr), H10 binary tree,
 Zopfli DP (Float32!), BrotliBuildMetaBlock.
